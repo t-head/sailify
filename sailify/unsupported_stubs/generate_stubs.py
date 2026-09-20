@@ -5,7 +5,10 @@ header file (``ppu_unsupported_stubs.h``) containing ``static inline`` stub
 functions.  Each stub prints an error message and calls ``exit(1)``.
 
 The JSON config already contains PPU-mapped function names and types —
-this module simply formats them into C code.
+this module simply formats them into C code.  An API may carry an optional
+``version`` range (``{"begin": .., "end": ..}`` in ``PPU_SDK_VERSION`` units,
+major*10000+minor*100+patch) restricting the stub to those SDK versions;
+without it the stub is defined for every version.
 
 Usage from sailify_python.py::
 
@@ -30,6 +33,27 @@ def _format_param(decl_template: str, name: str) -> str:
     if '{}' in decl_template:
         return decl_template.format(name)
     return f"{decl_template} {name}"
+
+
+def _version_gate(api: dict) -> str:
+    """``#if`` line limiting a stub to its unsupported SDK-version range.
+
+    PPU_SDK_VERSION == 0 (unknown) is included so the legacy behavior of
+    defining every stub is kept when the SDK version could not be detected.
+    """
+    ver = api.get("version") or {}
+    begin = ver.get("begin")
+    end = ver.get("end")
+    if begin is None and end is None:
+        return ""
+    conds = ["PPU_SDK_VERSION == 0"]
+    if begin is not None and end is not None:
+        conds.append(f"(PPU_SDK_VERSION >= {int(begin)} && PPU_SDK_VERSION <= {int(end)})")
+    elif begin is not None:
+        conds.append(f"PPU_SDK_VERSION >= {int(begin)}")
+    else:
+        conds.append(f"PPU_SDK_VERSION <= {int(end)}")
+    return "#if " + " || ".join(conds)
 
 
 def _generate_stub_function(api: dict) -> str:
@@ -104,7 +128,12 @@ def generate_stubs_header() -> str:
         lines.append("")
 
         for api in lib_apis:
+            gate = _version_gate(api)
+            if gate:
+                lines.append(gate)
             lines.append(_generate_stub_function(api))
+            if gate:
+                lines.append("#endif")
             lines.append("")
 
     lines.append("#endif /* PPU_UNSUPPORTED_STUBS_H */")

@@ -18,6 +18,25 @@
 #include <stdlib.h>
 #include <hggc.h>
 
+/* ── PPU SDK version ──
+ * Resolved by sailify ({ppu_sdk_str} here); 0 = unknown keeps the legacy
+ * behavior.  Override at compile time with
+ * -DPPU_SDK_VERSION=<major>*10000+<minor>*100+<patch>. */
+#ifndef PPU_SDK_VERSION_MAJOR
+#define PPU_SDK_VERSION_MAJOR {ppu_sdk_major}
+#endif
+#ifndef PPU_SDK_VERSION_MINOR
+#define PPU_SDK_VERSION_MINOR {ppu_sdk_minor}
+#endif
+#ifndef PPU_SDK_VERSION_PATCH
+#define PPU_SDK_VERSION_PATCH {ppu_sdk_patch}
+#endif
+#ifndef PPU_SDK_VERSION
+#define PPU_SDK_VERSION ((PPU_SDK_VERSION_MAJOR) * 10000 \
+                         + (PPU_SDK_VERSION_MINOR) * 100 \
+                         + (PPU_SDK_VERSION_PATCH))
+#endif
+
 /* PPU SDK fixups — must come before other PPU SDK headers */
 #include "ppu_sdk_fixups.h"
 
@@ -139,6 +158,15 @@ extern "C" {{
 static inline hggcError_t compatibleDriverGetVersion(int *driverVersion) {{
     if (driverVersion) *driverVersion = COMPATIBLE_VERSION;
     return (hggcError_t)0;
+}}
+
+/* cuDriverGetVersion is a driver API entry point: it returns HGresult (see
+ * hggc.h), not hggcError_t, so it cannot share compatibleDriverGetVersion.
+ * It still reports COMPATIBLE_VERSION (not the PPU driver version) so that
+ * CUDA-style version checks keep working. */
+static inline HGresult compatDriverGetVersion(int *driverVersion) {{
+    if (driverVersion) *driverVersion = COMPATIBLE_VERSION;
+    return HGGC_SUCCESS;
 }}
 
 static inline hggcError_t compatibleRuntimeGetVersion(int *runtimeVersion) {{

@@ -26,6 +26,12 @@ from .cuda_to_ppu_mappings import (
     CUDA_TO_PPU_MAPPINGS,
 )
 from .unsupported_stubs import write_stubs_header
+from .ppu_sdk_version import (
+    detect_ppu_sdk_version,
+    detect_runtime_api_version,
+    format_version_string,
+    version_to_int,
+)
 
 __all__ = [
     "CurrentState",
@@ -47,7 +53,7 @@ log = logging.getLogger(__name__)
 # ── Default version configuration ─────────────────────────────────────
 # Default versions for the COMPATIBLE_XXX macros in compatible_wrapper.h.
 # These can be overridden via CLI (--cuda-version, etc.) or --config-json.
-DEFAULT_VERSION_CONFIG = {
+DEFAULT_VERSION_CONFIG_V3 = {
     "cuda": "13.0.0",
     "cublas": "13.0.0",
     "cufft": "12.0.0",
@@ -60,6 +66,26 @@ DEFAULT_VERSION_CONFIG = {
     "cupti": 130000,
     "npp": "13.0.50",
 }
+
+DEFAULT_VERSION_CONFIG_V2 = {
+    "cuda": "12.9.0",
+    "cublas": "12.9.0",
+    "cufft": "11.4.0",
+    "curand": "10.3.10",
+    "cusparse": "12.5.9",
+    "cusolver": "11.7.4",
+    "cudnn": "8.9.5",
+    "nccl": "2.27.3",
+    "video": "13.0.19",
+    "cupti": 120900,
+    "npp": "12.4.27",
+}
+
+
+def _default_version_config(runtime_api_version):
+    if runtime_api_version == 2:
+        return DEFAULT_VERSION_CONFIG_V2
+    return DEFAULT_VERSION_CONFIG_V3
 
 
 def _parse_version_string(version_str, encoding="cuda"):
@@ -96,9 +122,15 @@ def _parse_version_string(version_str, encoding="cuda"):
         raise ValueError(f"Unknown version encoding: {encoding}")
 
 
-def _generate_compat_wrapper_header(version_config=None):
-    """Generate the content of compatible_wrapper.h with the given version config."""
-    cfg = dict(DEFAULT_VERSION_CONFIG)
+def _generate_compat_wrapper_header(version_config=None, ppu_sdk_version=None,
+                                    runtime_api_version=None):
+    """Generate the content of compatible_wrapper.h with the given version config.
+
+    *ppu_sdk_version* is a (major, minor[, patch]) tuple of the PPU SDK
+    (detected by sailify or set via --ppu-sdk-version).  None means unknown
+    and yields PPU_SDK_VERSION 0, i.e. the legacy fixup behavior.
+    """
+    cfg = dict(_default_version_config(runtime_api_version))
     if version_config:
         cfg.update(version_config)
 
@@ -129,6 +161,14 @@ def _generate_compat_wrapper_header(version_config=None):
     cusolver_major, cusolver_minor, cusolver_patch = _ver_parts(cfg["cusolver"])
     nccl_major, nccl_minor, nccl_patch = _ver_parts(cfg["nccl"])
     npp_major, npp_minor, npp_build = _ver_parts(cfg["npp"])
+
+    if ppu_sdk_version:
+        ppu_sdk_major, ppu_sdk_minor, ppu_sdk_patch = \
+            (tuple(ppu_sdk_version) + (0, 0, 0))[:3]
+        ppu_sdk_str = format_version_string(ppu_sdk_version)
+    else:
+        ppu_sdk_major, ppu_sdk_minor, ppu_sdk_patch = 0, 0, 0
+        ppu_sdk_str = "unknown"
 
     tpl_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "compatible_wrapper.h.tpl")
@@ -164,19 +204,26 @@ def _generate_compat_wrapper_header(version_config=None):
         video_ver=video_ver,
         cupti_ver=cupti_ver,
         npp_major=npp_major, npp_minor=npp_minor, npp_build=npp_build,
+        ppu_sdk_str=ppu_sdk_str,
+        ppu_sdk_major=ppu_sdk_major,
+        ppu_sdk_minor=ppu_sdk_minor,
+        ppu_sdk_patch=ppu_sdk_patch,
     )
 
 
 # Static compat headers that ship alongside compatible_wrapper.h
-_COMPAT_STATIC_HEADERS = ["hgperf_common.h", "hgperf_host.h", "ppu_sdk_fixups.h", "mma.h"]
+_COMPAT_STATIC_HEADERS = ["hgperf_common.h", "hgperf_host.h", "ppu_sdk_fixups.h", "mma.h", "hggc_fp4.h", "hggc_device_runtime_api.h"]
 
 
-def write_compat_wrapper_header(compat_dir, version_config=None):
+def write_compat_wrapper_header(compat_dir, version_config=None,
+                                ppu_sdk_version=None, runtime_api_version=None):
     """Write compatible_wrapper.h and static compat headers to compat_dir/."""
     os.makedirs(compat_dir, exist_ok=True)
     header_path = os.path.join(compat_dir, "compatible_wrapper.h")
 
-    content = _generate_compat_wrapper_header(version_config)
+    content = _generate_compat_wrapper_header(
+        version_config, ppu_sdk_version, runtime_api_version
+    )
     with open(header_path, "w") as f:
         f.write(content)
     if version_config:
@@ -457,7 +504,7 @@ def get_ppu_file_path(rel_filepath: str) -> str:
 
 
 def _mask_comments_and_strings(source: str) -> str:
-    """Replace characters inside comments, string literals, and char literals with 'x'."""
+    """Mask comments and char literals with 'x' to gate identifier replacement."""
     n = len(source)
     in_include = [False] * n
     line_start = 0
@@ -578,15 +625,15 @@ def _mask_comments_and_strings(source: str) -> str:
 
         elif in_context == '"':
             if c == '\\':
-                result.append('x')
+                result.append(c)
                 i += 1
                 if i < n:
-                    result.append('x')
+                    result.append(source[i])
                     i += 1
                 continue
             if c == '"':
                 in_context = ''
-            result.append('x')
+            result.append(c)
             i += 1
 
         elif in_context == "'":
@@ -607,14 +654,15 @@ def _mask_comments_and_strings(source: str) -> str:
             close_seq = ')' + delim + '"'
             close_pos = source.find(close_seq, i)
             if close_pos == -1:
-                for _ in range(i, n):
-                    result.append('x')
+                for j in range(i, n):
+                    result.append(source[j])
                 i = n
             else:
-                end = close_pos + len(close_seq)
-                for _ in range(i, end):
+                for j in range(i, close_pos):
+                    result.append(source[j])
+                for _ in range(close_pos, close_pos + len(close_seq)):
                     result.append('x')
-                i = end
+                i = close_pos + len(close_seq)
                 in_context = ''
         else:
             result.append(c)
@@ -808,6 +856,18 @@ def _copytree_compat(src, dst, ignore=None):
 
 # ── Main entry point ─────────────────────────────────────────────────
 
+def _print_detected_versions(ppu_sdk_version, runtime_api_version):
+    if ppu_sdk_version:
+        print(f"sailify: PPU SDK {format_version_string(ppu_sdk_version)} detected "
+              f"(PPU_SDK_VERSION {version_to_int(ppu_sdk_version)})")
+    else:
+        print("sailify: PPU SDK version unknown; keeping legacy fixups "
+              "(set $PPU_SDK or pass --ppu-sdk-version)")
+    cuda_default = "12.9" if runtime_api_version == 2 else "13.0"
+    print(f"sailify: hggcrt Runtime API v{runtime_api_version} "
+          f"(COMPATIBLE_* defaults follow CUDA {cuda_default})")
+
+
 def sailify(
     project_directory: str,
     output_directory: str = "",
@@ -822,8 +882,14 @@ def sailify(
     ppu_compat_dir: str = "",
     extra_mapping: str = "",
     verbose: bool = False,
+    ppu_sdk_version: tuple = None,
 ) -> dict:
-    """Convert CUDA code to PPU code in the given project directory."""
+    """Convert CUDA code to PPU code in the given project directory.
+
+    *ppu_sdk_version* — explicit (major, minor[, patch]) PPU SDK tuple for
+    the version-conditional fixups.  When None it is auto-detected from the
+    environment (see ppu_sdk_version.detect_ppu_sdk_version).
+    """
     if not os.path.isdir(project_directory):
         raise FileNotFoundError(f"Project directory not found: {project_directory}")
 
@@ -870,8 +936,17 @@ def sailify(
             version_config = {}
 
         if install_ppu_compat:
+            if ppu_sdk_version is None:
+                ppu_sdk_version = detect_ppu_sdk_version()
+            runtime_api_version = detect_runtime_api_version()
+            _print_detected_versions(ppu_sdk_version, runtime_api_version)
             compat_dir = ppu_compat_dir or os.path.join(output_directory, ".ppu_compat")
-            write_compat_wrapper_header(compat_dir, version_config if version_config else None)
+            write_compat_wrapper_header(
+                compat_dir,
+                version_config if version_config else None,
+                ppu_sdk_version=ppu_sdk_version,
+                runtime_api_version=runtime_api_version,
+            )
 
         results = {}
 
@@ -899,18 +974,30 @@ def sailify(
     return results
 
 
+def _ensure_ppu_compat(output_directory: str) -> None:
+    """(Re)generate .ppu_compat in output_directory with the detected PPU SDK version."""
+    compat_dir = os.path.join(output_directory, ".ppu_compat")
+    ppu_sdk_version = detect_ppu_sdk_version()
+    runtime_api_version = detect_runtime_api_version()
+    _print_detected_versions(ppu_sdk_version, runtime_api_version)
+    write_compat_wrapper_header(compat_dir, ppu_sdk_version=ppu_sdk_version,
+                                runtime_api_version=runtime_api_version)
+
+
 def sailify_extra_files(
     output_directory: str,
     extra_files: list,
     show_detailed: bool = False,
+    install_ppu_compat: bool = True,
 ) -> dict:
     """Sailify only the specified extra_files.
 
     Converts a list of user-provided CUDA source files in-place and returns
     a dict mapping absolute input path -> SailifyResult.
-
     """
     output_directory = os.path.abspath(output_directory)
+    if install_ppu_compat:
+        _ensure_ppu_compat(output_directory)
     stats: Dict[str, list] = {}
     results = {}
 
@@ -986,6 +1073,7 @@ def sailify_extra_files_recursive(
     header_include_dirs: list = None,
     show_detailed: bool = False,
     backup: bool = False,
+    install_ppu_compat: bool = True,
 ) -> dict:
     """Sailify extra_files with recursive #include dependency discovery.
 
@@ -1005,6 +1093,8 @@ def sailify_extra_files_recursive(
         Dict mapping absolute input path -> SailifyResult.
     """
     output_directory = os.path.abspath(output_directory)
+    if install_ppu_compat:
+        _ensure_ppu_compat(output_directory)
     _header_include_dirs = header_include_dirs or []
     stats: Dict[str, list] = {}
     results = {}

@@ -61,6 +61,13 @@ sailify --config-json config.json
 | `--nccl-version` | NCCL version |
 | `--video-version` | Video Codec SDK version |
 | `--cupti-version` | CUPTI API version number |
+| `--npp-version` | NPP version |
+| `--ppu-sdk-version` | PPU SDK version for conditional fixups (e.g. `2.2` or `2v2`). Auto-detected when omitted |
+
+When no `--*-version` option is given, the `COMPATIBLE_*` defaults follow the
+detected hggcrt Runtime API version: `Runtime API version vN` from
+`hgcc --version`, else an `hggcrt_version:vN` line in `$PPU_PATH/VERSION.txt`,
+else v3.
 
 ### Python API
 
@@ -107,6 +114,15 @@ When `install_ppu_compat=True` (default), sailify generates compatibility header
 ```bash
 hgcc -I/path/to/output/.ppu_compat -include compatible_wrapper.h ...
 ```
+
+### PPU SDK Version Detection
+
+`ppu_sdk_fixups.h` contains shims whose behavior depends on the PPU SDK release. sailify resolves the SDK version when generating `.ppu_compat/` and bakes it into `compatible_wrapper.h` as `PPU_SDK_VERSION` (`major * 10000 + minor * 100 + patch`, e.g. 2.1 → 20100, 2.1.1 → 20101, 2.2 → 20200; 0 = unknown):
+
+1. `--ppu-sdk-version` (CLI) / `ppu_sdk_version` (config JSON / `sailify()` keyword) — explicit, wins over everything.
+2. `hgcc --version` — the compiler is located via `hgcc` on `PATH`, then `$PPU_SDK/bin`, then `$PPU_HOME/bin`.
+
+If none succeed, `PPU_SDK_VERSION` is 0 and the legacy fixup behavior is kept; a warning is logged at conversion time. The macro can also be overridden at compile time with `-DPPU_SDK_VERSION=...`.
 
 ## License
 

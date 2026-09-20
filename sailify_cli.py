@@ -112,6 +112,11 @@ def main():
         "--npp-version", type=str, default=None,
         help="NPP version for compatiblePpGetLibVersion (e.g. 13.0.50).",
     )
+    parser.add_argument(
+        "--ppu-sdk-version", type=str, default=None,
+        help="PPU SDK version for conditional fixups (e.g. 2.2, 2v2 or "
+             "2.1.1). Auto-detected from `hgcc --version` when omitted.",
+    )
 
     args = parser.parse_args()
 
@@ -130,6 +135,7 @@ def main():
     extra_mapping = args.extra_mapping
     backup = args.backup
     version_config = {}
+    ppu_sdk_version_raw = None
 
     if args.config_json:
         if not os.path.isfile(args.config_json):
@@ -155,6 +161,8 @@ def main():
             extra_mapping = os.path.join(config_dir, cfg["extra_mapping"])
         if "version_config" in cfg and cfg["version_config"]:
             version_config.update(cfg["version_config"])
+        if cfg.get("ppu_sdk_version"):
+            ppu_sdk_version_raw = str(cfg["ppu_sdk_version"])
 
     # Build version config from CLI args (overrides JSON)
     if args.cuda_version:
@@ -182,6 +190,18 @@ def main():
     if not version_config:
         version_config = None
 
+    # PPU SDK version for conditional fixups: CLI wins over config JSON;
+    # when unset, sailify() auto-detects it.
+    ppu_sdk_version = None
+    if args.ppu_sdk_version:
+        ppu_sdk_version_raw = args.ppu_sdk_version
+    if ppu_sdk_version_raw:
+        from sailify.ppu_sdk_version import parse_version_string
+        try:
+            ppu_sdk_version = parse_version_string(ppu_sdk_version_raw)
+        except ValueError as e:
+            parser.error(str(e))
+
     if not project_directory:
         parser.error("project_directory or --config-json is required.")
 
@@ -206,6 +226,7 @@ def main():
         install_ppu_compat=args.install_ppu_compat,
         ppu_compat_dir=args.ppu_compat_dir or "",
         verbose=args.verbose,
+        ppu_sdk_version=ppu_sdk_version,
     )
 
     # Summary

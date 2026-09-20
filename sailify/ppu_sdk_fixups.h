@@ -7,7 +7,17 @@
  * Included from compatible_wrapper.h in two phases:
  * 1. Pre-include  : before PPU SDK headers
  * 2. Post-include : after PPU SDK headers (activated by PPU_SDK_FIXUPS_POST)
+ *
+ * Version-conditional shims are keyed off PPU_SDK_VERSION
+ * (major * 10000 + minor * 100 + patch: 2.1 -> 20100,
+ * 2.1.1 -> 20101, 2.2 -> 20200), defined by
+ * compatible_wrapper.h from the version sailify detected or the
+ * --ppu-sdk-version option.  0 = unknown keeps the legacy shims.
  */
+
+#ifndef PPU_SDK_VERSION
+#define PPU_SDK_VERSION 0
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════════
  * Phase 1: Pre-include fixes
@@ -59,7 +69,9 @@ typedef struct acdnnPersistentRNNPlan *acdnnPersistentRNNPlan_t;
 #undef ACDNN_CONVOLUTION_BWD_FILTER_ALGO_COUNT
 #define ACDNN_CONVOLUTION_BWD_FILTER_ALGO_COUNT 7
 
-/* Missing hggcDataType fp8/fp6/fp4 enum values. C++ needs explicit enum cast. */
+/* Missing hggcDataType fp8/fp6/fp4 enum values. C++ needs explicit enum cast.
+ * PPU SDK >= 2.2 provides them natively. */
+#if PPU_SDK_VERSION < 20200
 #define HGGC_R_8F_UE4M3 HGGC_R_8F_E4M3
 #if defined(__cplusplus)
 #define HGGC_R_8F_UE8M0 ((hggcDataType)30)
@@ -72,6 +84,7 @@ typedef struct acdnnPersistentRNNPlan *acdnnPersistentRNNPlan_t;
 #define HGGC_R_6F_E3M2  32
 #define HGGC_R_4F_E2M1  33
 #endif
+#endif /* PPU_SDK_VERSION < 20200 */
 
 /* HGML_DEVICE_PCI_BUS_ID_FMT format string mismatch. */
 #undef HGML_DEVICE_PCI_BUS_ID_FMT
@@ -420,7 +433,9 @@ static inline acblasStatus_t acblasGemmStridedBatchedEx(acblasHandle_t handle,
                         migratedComputeType,
                         algo);
 }
-/* Missing CUPTI CBID enum values. Defined as _SIZE sentinel (no-op). */
+/* Missing CUPTI CBID enum values, defined as _SIZE sentinels (no-op).
+ * PPU SDK >= 2.2 defines them natively. */
+#if PPU_SDK_VERSION < 20200
 #ifndef HGPTI_HGGC_DRIVER_CBID_hgFuncGetParamInfo
 #define HGPTI_HGGC_DRIVER_CBID_hgFuncGetParamInfo HGPTI_HGGC_DRIVER_CBID_SIZE
 #endif
@@ -428,8 +443,62 @@ static inline acblasStatus_t acblasGemmStridedBatchedEx(acblasHandle_t handle,
 #ifndef HGPTI_HGGC_RUNTIME_CBID_hggcLibraryLoadData_v12060
 #define HGPTI_HGGC_RUNTIME_CBID_hggcLibraryLoadData_v12060 HGPTI_HGGC_RUNTIME_CBID_SIZE
 #endif
+#endif /* PPU_SDK_VERSION < 20200 */
 
 #endif /* __cplusplus */
+
+/* PPU SDK's hggc/functional port lacks hggc::maximum / hggc::minimum
+ * (CCCL cuda::maximum / cuda::minimum, which sailify maps onto).  < 20300
+ * keeps the shim for every 2.2.x patch release. */
+#if defined(__cplusplus) && (PPU_SDK_VERSION < 20300)
+#ifndef __host__
+#define __host__ __attribute__((host))
+#endif
+#ifndef __device__
+#define __device__ __attribute__((device))
+#endif
+namespace hggc {
+
+template <class T = void>
+struct maximum {
+    __host__ __device__ constexpr T operator()(const T& lhs, const T& rhs) const
+        noexcept(noexcept((lhs < rhs) ? rhs : lhs)) {
+        return (lhs < rhs) ? rhs : lhs;
+    }
+};
+
+template <>
+struct maximum<void> {
+    template <class T1, class T2>
+    __host__ __device__ constexpr auto
+    operator()(const T1& lhs, const T2& rhs) const
+        noexcept(noexcept((lhs < rhs) ? rhs : lhs))
+        -> decltype(false ? lhs : rhs) {
+        return (lhs < rhs) ? rhs : lhs;
+    }
+};
+
+template <class T = void>
+struct minimum {
+    __host__ __device__ constexpr T operator()(const T& lhs, const T& rhs) const
+        noexcept(noexcept((rhs < lhs) ? rhs : lhs)) {
+        return (rhs < lhs) ? rhs : lhs;
+    }
+};
+
+template <>
+struct minimum<void> {
+    template <class T1, class T2>
+    __host__ __device__ constexpr auto
+    operator()(const T1& lhs, const T2& rhs) const
+        noexcept(noexcept((rhs < lhs) ? rhs : lhs))
+        -> decltype(false ? lhs : rhs) {
+        return (rhs < lhs) ? rhs : lhs;
+    }
+};
+
+}  // namespace hggc
+#endif /* __cplusplus && PPU_SDK_VERSION < 20300 */
 
 #undef PPU_SDK_FIXUPS_POST
 #endif /* PPU_SDK_FIXUPS_POST */

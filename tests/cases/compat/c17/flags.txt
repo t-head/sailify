@@ -1,0 +1,3 @@
+--extended-lambda
+-std=c++17
+--expt-relaxed-constexpr

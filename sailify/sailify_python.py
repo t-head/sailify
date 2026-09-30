@@ -24,6 +24,7 @@ from typing import Iterable, Iterator, Optional, Dict, List
 
 from .cuda_to_ppu_mappings import (
     CUDA_TO_PPU_MAPPINGS,
+    PPU_SDK_2_2_IDENTIFIER_MAP,
 )
 from .unsupported_stubs import write_stubs_header
 from .ppu_sdk_version import (
@@ -347,6 +348,37 @@ for _mapping in CUDA_TO_PPU_MAPPINGS:
 _RE_PPU_PREPROCESSOR = re.compile(
     r"(?<!\w)(" + _PPU_TRIE.export_to_regex() + r")(?!\w)"
 )
+
+# ── SDK-version-conditional mappings (PPU SDK >= 2.2) ─────────────────
+
+_SDK_2_2_VERSION_INT = 20200  # version_to_int((2, 2, 0))
+
+_SDK22_MAP: Dict[str, str] = {}
+_SDK22_RE: Optional[re.Pattern] = None
+
+
+def _enable_sdk_2_2_mappings() -> None:
+    """Activate the PPU SDK >= 2.2 identifier group (idempotent)."""
+    global _SDK22_MAP, _SDK22_RE
+    if _SDK22_RE is not None:
+        return
+    trie = Trie()
+    mapping = {}
+    for src, dst in PPU_SDK_2_2_IDENTIFIER_MAP.items():
+        trie.add(src)
+        mapping[src] = dst
+    _SDK22_MAP = mapping
+    _SDK22_RE = re.compile(r"(?<!\w)(" + trie.export_to_regex() + r")(?!\w)")
+
+
+def _maybe_enable_sdk_2_2_mappings(ppu_sdk_version) -> None:
+    global _SDK22_MAP, _SDK22_RE
+    if ppu_sdk_version is not None and version_to_int(ppu_sdk_version) >= _SDK_2_2_VERSION_INT:
+        _enable_sdk_2_2_mappings()
+    else:
+        _SDK22_MAP = {}
+        _SDK22_RE = None
+
 
 # ── Custom mapping support ────────────────────────────────────────────
 
@@ -788,6 +820,21 @@ def preprocessor(
     _new_parts.append(output_source[_last_end:])
     output_source = "".join(_new_parts)
 
+    # 2b. Apply the SDK >= 2.2 identifier group (enabled when the detected
+    # SDK version is 2.2+)
+    if _SDK22_MAP and _SDK22_RE is not None:
+        _masked22 = _mask_comments_and_strings(output_source)
+        _new_parts = []
+        _last_end = 0
+        for _m in _SDK22_RE.finditer(output_source):
+            if _masked22[_m.start()] == 'x':
+                continue
+            _new_parts.append(output_source[_last_end:_m.start()])
+            _new_parts.append(_SDK22_MAP.get(_m.group(1), _m.group(1)))
+            _last_end = _m.end()
+        _new_parts.append(output_source[_last_end:])
+        output_source = "".join(_new_parts)
+
     for _pat, _repl in _EXTRA_MAPPING_LISTS:
         output_source = output_source.replace(_pat, _repl)
 
@@ -935,9 +982,10 @@ def sailify(
         if version_config is None:
             version_config = {}
 
+        if ppu_sdk_version is None:
+            ppu_sdk_version = detect_ppu_sdk_version()
+        _maybe_enable_sdk_2_2_mappings(ppu_sdk_version)
         if install_ppu_compat:
-            if ppu_sdk_version is None:
-                ppu_sdk_version = detect_ppu_sdk_version()
             runtime_api_version = detect_runtime_api_version()
             _print_detected_versions(ppu_sdk_version, runtime_api_version)
             compat_dir = ppu_compat_dir or os.path.join(output_directory, ".ppu_compat")
@@ -978,6 +1026,7 @@ def _ensure_ppu_compat(output_directory: str) -> None:
     """(Re)generate .ppu_compat in output_directory with the detected PPU SDK version."""
     compat_dir = os.path.join(output_directory, ".ppu_compat")
     ppu_sdk_version = detect_ppu_sdk_version()
+    _maybe_enable_sdk_2_2_mappings(ppu_sdk_version)
     runtime_api_version = detect_runtime_api_version()
     _print_detected_versions(ppu_sdk_version, runtime_api_version)
     write_compat_wrapper_header(compat_dir, ppu_sdk_version=ppu_sdk_version,
@@ -996,6 +1045,7 @@ def sailify_extra_files(
     a dict mapping absolute input path -> SailifyResult.
     """
     output_directory = os.path.abspath(output_directory)
+    _maybe_enable_sdk_2_2_mappings(detect_ppu_sdk_version())
     if install_ppu_compat:
         _ensure_ppu_compat(output_directory)
     stats: Dict[str, list] = {}
@@ -1093,6 +1143,7 @@ def sailify_extra_files_recursive(
         Dict mapping absolute input path -> SailifyResult.
     """
     output_directory = os.path.abspath(output_directory)
+    _maybe_enable_sdk_2_2_mappings(detect_ppu_sdk_version())
     if install_ppu_compat:
         _ensure_ppu_compat(output_directory)
     _header_include_dirs = header_include_dirs or []

@@ -1,0 +1,129 @@
+name: CI Pipeline
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  precheck:
+    name: Pre-check
+    uses: t-head/.github/.github/workflows/user-precheck.yml@main
+
+  smoke-test:
+    name: Smoke Test
+    needs: precheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install sailify
+        run: python -m pip install -e .
+
+      - name: Run smoke tests
+        run: python tests/api_patterns_test.py
+
+  ai-code-review:
+    name: AI Code Review (Copilot Gate)
+    needs: precheck
+    uses: t-head/.github/.github/workflows/ai-code-review.yml@main
+    secrets: inherit
+
+  human-review:
+    name: Human Review Gate
+    needs: [smoke-test, ai-code-review]
+    uses: t-head/.github/.github/workflows/human-review.yml@main
+    secrets: inherit
+
+  ci:
+    name: Full CI
+    needs: human-review
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PPU_SDK_URL: ${{ vars.PPU_SDK_URL }}
+      PPU_SDK_SHA256: ${{ vars.PPU_SDK_SHA256 }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Download and install PPU SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${PPU_SDK_URL}" || -z "${PPU_SDK_SHA256}" ]]; then
+            echo "::error::Repository variables PPU_SDK_URL and PPU_SDK_SHA256 must be configured"
+            exit 1
+          fi
+
+          installer="${RUNNER_TEMP}/ppu_hggcrt13_ubuntu2404.run"
+          curl --fail --location --retry 3 --retry-delay 5 \
+            --output "${installer}" "${PPU_SDK_URL}"
+          echo "${PPU_SDK_SHA256}  ${installer}" | sha256sum --check
+          sudo bash "${installer}" --prefix=/usr/local/ --silent
+
+          sdk_dir=/usr/local/PPU_SDK
+          if [[ ! -f "${sdk_dir}/envsetup.sh" ]]; then
+            sdk_env=$(sudo find /usr/local -maxdepth 3 -type f \
+              -name envsetup.sh \
+              ! -path '*/ppu-smi/*' \
+              ! -path '*/asight/*' \
+              -print -quit)
+            if [[ -n "${sdk_env}" ]]; then
+              sdk_dir=$(dirname "${sdk_env}")
+            fi
+          fi
+
+          if [[ ! -f "${sdk_dir}/envsetup.sh" ]]; then
+            echo "PPU SDK envsetup.sh not found under /usr/local" >&2
+            sudo find /usr/local -maxdepth 2 -type d -print
+            exit 1
+          fi
+
+          {
+            echo "PPU_SDK=${sdk_dir}"
+            echo "PPU_PATH=${sdk_dir}"
+            echo "PPU_HOME=${sdk_dir}"
+          } >> "${GITHUB_ENV}"
+          echo "PPU_SDK=${sdk_dir}"
+
+      - name: Install sailify
+        run: python -m pip install -e .
+
+      - name: Run full test suite
+        shell: bash
+        run: |
+          export TMPDIR="${RUNNER_TEMP}"
+          bash tests/run_tests.sh
+
+      - name: Upload test logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sailify-test-logs
+          path: ${{ runner.temp }}/sailify_tests_run/logs/
+          if-no-files-found: ignore
+          retention-days: 7

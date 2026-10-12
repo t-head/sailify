@@ -51,6 +51,8 @@ sailify --config-json config.json
 | `--backup` | Create .bak backup files before in-place conversion |
 | `--no-ppu-compat` | Skip generating .ppu_compat/ compat headers |
 | `--ppu-compat-dir` | Custom directory for .ppu_compat headers (default: `<output>/.ppu_compat`) |
+| `--inject-compat-include` | Prepend `#include <.ppu_compat/compatible_wrapper.h>` to every converted header so builds no longer need `-include compatible_wrapper.h`; the path segment follows the `--ppu-compat-dir` name, and the include search path must point at the compat dir's parent |
+| `--inject-compat-include-ignore` | Glob patterns (relative to project root) of headers exempt from the injection. Repeatable; also available as `inject_compat_include_ignores` in the config JSON |
 | `--cuda-version` | CUDA version for COMPATIBLE_VERSION macro |
 | `--cublas-version` | cuBLAS version |
 | `--cufft-version` | cuFFT version |
@@ -80,6 +82,7 @@ results = sailify(
     excludes=["third_party"],
     version_config={"cuda": "13.0.0", "cudnn": "8.9.5"},
     install_ppu_compat=True,
+    inject_compat_include=True,
     verbose=True,
 )
 ```
@@ -114,6 +117,8 @@ When `install_ppu_compat=True` (default), sailify generates compatibility header
 ```bash
 hgcc -I/path/to/output/.ppu_compat -include compatible_wrapper.h ...
 ```
+
+Alternatively, `--inject-compat-include` embeds `#include <.ppu_compat/compatible_wrapper.h>` as the first line of every converted header (idempotent across re-runs), so only `-I/path/to/output` — the compat dir's parent — is needed.
 
 ### PPU SDK Version Detection
 

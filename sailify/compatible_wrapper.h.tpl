@@ -14,9 +14,7 @@
  *   Video: {video_str}, CUPTI: {cupti_ver}, NPP: {npp_major}.{npp_minor}.{npp_build}
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <hggc.h>
+/* ── SDK-independent part ── */
 
 /* ── PPU SDK version ──
  * Resolved by sailify ({ppu_sdk_str} here); 0 = unknown keeps the legacy
@@ -36,36 +34,6 @@
                          + (PPU_SDK_VERSION_MINOR) * 100 \
                          + (PPU_SDK_VERSION_PATCH))
 #endif
-
-/* PPU SDK fixups — must come before other PPU SDK headers */
-#include "ppu_sdk_fixups.h"
-
-/* PPU SDK headers — C++ only (pure C third-party code may conflict) */
-#if defined(__cplusplus)
-
-#include <hgpti_result.h>
-#include <hgrtc.h>
-#include <hgJitLink.h>
-#include <hgTIXCompiler.h>
-#include <acblas_v2.h>
-#include <acfft.h>
-#include <acrand.h>
-#include <acsparse.h>
-#include <acsolver_common.h>
-#include <acsolverDn.h>
-#include <acdnn.h>
-#include <hgml.h>
-#include <hgpti_checkpoint.h>
-#include <hgpti_pcsampling_util.h>
-#include <hggc_library_types.h>
-#include <hgppdefs.h>
-#include <hgppcore.h>
-
-#endif /* __cplusplus */
-
-/* PPU SDK fixups (post-include phase) */
-#define PPU_SDK_FIXUPS_POST
-#include "ppu_sdk_fixups.h"
 
 /* ── Version macros ── */
 
@@ -146,6 +114,52 @@
     #endif
   #endif
 #endif
+
+/* ── SDK-dependent part ── */
+#if defined(__has_include)
+#  if __has_include(<hggc.h>)
+#    define COMPAT_WRAPPER_HAS_PPU_SDK
+#  endif
+#else
+/* No __has_include support: assume the PPU toolchain. */
+#  define COMPAT_WRAPPER_HAS_PPU_SDK
+#endif
+
+#if defined(COMPAT_WRAPPER_HAS_PPU_SDK)
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <hggc.h>
+
+/* PPU SDK fixups — must come before other PPU SDK headers */
+#include "ppu_sdk_fixups.h"
+
+/* PPU SDK headers — C++ only (pure C third-party code may conflict) */
+#if defined(__cplusplus)
+
+#include <hgpti_result.h>
+#include <hgrtc.h>
+#include <hgJitLink.h>
+#include <hgTIXCompiler.h>
+#include <acblas_v2.h>
+#include <acfft.h>
+#include <acrand.h>
+#include <acsparse.h>
+#include <acsolver_common.h>
+#include <acsolverDn.h>
+#include <acdnn.h>
+#include <hgml.h>
+#include <hgpti_checkpoint.h>
+#include <hgpti_pcsampling_util.h>
+#include <hggc_library_types.h>
+#include <hgppdefs.h>
+#include <hgppcore.h>
+
+#endif /* __cplusplus */
+
+/* PPU SDK fixups (post-include phase) */
+#define PPU_SDK_FIXUPS_POST
+#include "ppu_sdk_fixups.h"
 
 /* ── GetVersion API stubs ── */
 
@@ -320,5 +334,7 @@ static inline acsolverStatus_t compatibleSolverGetProperty(hggcLibraryPropertyTy
 #endif
 
 #endif /* __cplusplus */
+
+#endif /* COMPAT_WRAPPER_HAS_PPU_SDK */
 
 #endif /* COMPATIBLE_WRAPPER_H */

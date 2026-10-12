@@ -38,6 +38,8 @@ __all__ = [
     "CurrentState",
     "SailifyResult",
     "Trie",
+    "COMPAT_WRAPPER_INCLUDE_LINE",
+    "compat_wrapper_include_line",
     "update_custom_mappings",
     "load_extra_mappings",
     "matched_files_iter",
@@ -247,7 +249,31 @@ def write_compat_wrapper_header(compat_dir, version_config=None,
 DEFAULT_EXTENSIONS = (".cu", ".cuh", ".c", ".cc", ".cpp", ".h", ".hpp", ".inl")
 DEFAULT_HEADER_EXTENSIONS = (".cuh", ".h", ".hpp")
 
-SKIP_DIRS = {".git", "build", "__pycache__", ".tox", "node_modules"}
+SKIP_DIRS = {".git", "build", "__pycache__", ".tox", "node_modules", ".ppu_compat"}
+
+# Prepended to converted headers when inject_compat_include is enabled; resolves
+# via the include search path pointing at the PARENT of the compat dir.
+COMPAT_WRAPPER_INCLUDE_LINE = "#include <.ppu_compat/compatible_wrapper.h>"
+
+
+def compat_wrapper_include_line(compat_dir: str) -> str:
+    """Wrapper include line for *compat_dir* (its basename is the path segment)."""
+    name = os.path.basename(os.path.normpath(compat_dir))
+    return f"#include <{name}/compatible_wrapper.h>"
+
+
+_COMPAT_INCLUDE_LINE_RE = re.compile(
+    r"^[ \t]*#[ \t]*include[ \t]*<[^\r\n>]*compatible_wrapper\.h>[ \t]*\r?\n?",
+    re.MULTILINE,
+)
+
+
+def _inject_compat_include(source: str, include_line: str = COMPAT_WRAPPER_INCLUDE_LINE) -> str:
+    """Prepend *include_line*, replacing any wrapper include left by an earlier run."""
+    has_bom = source.startswith("\ufeff")
+    body = source[1:] if has_bom else source
+    body = _COMPAT_INCLUDE_LINE_RE.sub("", body)
+    return ("\ufeff" if has_bom else "") + include_line + "\n" + body
 
 class CurrentState(Enum):
     INITIALIZED = 1
@@ -770,8 +796,18 @@ def preprocessor(
     show_progress: bool,
     project_directory: str = "",
     backup: bool = False,
+    inject_compat_include: bool = False,
+    inject_compat_include_ignores: Iterable[str] = (),
+    compat_include_line: str = COMPAT_WRAPPER_INCLUDE_LINE,
 ) -> SailifyResult:
-    """Process a single CUDA source file and write the PPU equivalent."""
+    """Process a single CUDA source file and write the PPU equivalent.
+
+    With *inject_compat_include*, header files (.h/.hpp/.cuh) additionally get
+    the compat wrapper include (*compat_include_line*) prepended.
+
+    *inject_compat_include_ignores* — glob patterns (relative to
+    *project_directory*) of headers to exempt from the injection.
+    """
     if project_directory:
         rel = os.path.relpath(filepath, project_directory)
     else:
@@ -837,6 +873,14 @@ def preprocessor(
 
     for _pat, _repl in _EXTRA_MAPPING_LISTS:
         output_source = output_source.replace(_pat, _repl)
+
+    if (
+        inject_compat_include
+        and os.path.splitext(filepath)[1] in DEFAULT_HEADER_EXTENSIONS
+        and not any(_matches_pattern(rel.replace(os.sep, "/"), pat)
+                    for pat in inject_compat_include_ignores)
+    ):
+        output_source = _inject_compat_include(output_source, compat_include_line)
 
     # Write output
     try:
@@ -927,6 +971,8 @@ def sailify(
     backup: bool = False,
     install_ppu_compat: bool = True,
     ppu_compat_dir: str = "",
+    inject_compat_include: bool = False,
+    inject_compat_include_ignores: list = None,
     extra_mapping: str = "",
     verbose: bool = False,
     ppu_sdk_version: tuple = None,
@@ -936,6 +982,14 @@ def sailify(
     *ppu_sdk_version* — explicit (major, minor[, patch]) PPU SDK tuple for
     the version-conditional fixups.  When None it is auto-detected from the
     environment (see ppu_sdk_version.detect_ppu_sdk_version).
+
+    *inject_compat_include* — prepend the compat wrapper include to every
+    converted header (.h/.hpp/.cuh).  The path segment follows the name of
+    *ppu_compat_dir* (default ``.ppu_compat``); consumers must put the PARENT
+    of the compat dir on their include search path.
+
+    *inject_compat_include_ignores* — glob patterns (relative to
+    *project_directory*) of headers exempt from the injection.
     """
     if not os.path.isdir(project_directory):
         raise FileNotFoundError(f"Project directory not found: {project_directory}")
@@ -967,6 +1021,13 @@ def sailify(
         else:
             output_directory = project_directory
 
+        compat_dir = ppu_compat_dir or os.path.join(output_directory, ".ppu_compat")
+        include_line = compat_wrapper_include_line(compat_dir)
+        _compat_dir_name = os.path.basename(os.path.normpath(compat_dir))
+        if _compat_dir_name not in SKIP_DIRS:
+            SKIP_DIRS.add(_compat_dir_name)
+            _added_skip_dirs.append(_compat_dir_name)
+
         _includes = includes or ["*"]
         _ignores = ignores or []
 
@@ -988,12 +1049,17 @@ def sailify(
         if install_ppu_compat:
             runtime_api_version = detect_runtime_api_version()
             _print_detected_versions(ppu_sdk_version, runtime_api_version)
-            compat_dir = ppu_compat_dir or os.path.join(output_directory, ".ppu_compat")
             write_compat_wrapper_header(
                 compat_dir,
                 version_config if version_config else None,
                 ppu_sdk_version=ppu_sdk_version,
                 runtime_api_version=runtime_api_version,
+            )
+        elif inject_compat_include:
+            log.warning(
+                "inject_compat_include is on but install_ppu_compat is off: converted "
+                "headers will reference %s which is not generated in this run.",
+                include_line,
             )
 
         results = {}
@@ -1008,6 +1074,9 @@ def sailify(
                 show_progress=verbose,
                 project_directory=project_directory,
                 backup=backup,
+                inject_compat_include=inject_compat_include,
+                inject_compat_include_ignores=inject_compat_include_ignores or [],
+                compat_include_line=include_line,
             )
             results[os.path.abspath(filepath)] = res
 
@@ -1038,6 +1107,8 @@ def sailify_extra_files(
     extra_files: list,
     show_detailed: bool = False,
     install_ppu_compat: bool = True,
+    inject_compat_include: bool = False,
+    inject_compat_include_ignores: list = None,
 ) -> dict:
     """Sailify only the specified extra_files.
 
@@ -1061,6 +1132,8 @@ def sailify_extra_files(
             clean_ctx=None,
             show_progress=show_detailed,
             project_directory=output_directory,
+            inject_compat_include=inject_compat_include,
+            inject_compat_include_ignores=inject_compat_include_ignores or [],
         )
         results[filepath] = res
 
@@ -1124,6 +1197,8 @@ def sailify_extra_files_recursive(
     show_detailed: bool = False,
     backup: bool = False,
     install_ppu_compat: bool = True,
+    inject_compat_include: bool = False,
+    inject_compat_include_ignores: list = None,
 ) -> dict:
     """Sailify extra_files with recursive #include dependency discovery.
 
@@ -1138,6 +1213,11 @@ def sailify_extra_files_recursive(
         header_include_dirs: Directories to search for #include'd headers.
         show_detailed: If True, log each file conversion.
         backup: If True, create .bak backups of files processed in-place.
+        install_ppu_compat: If True, (re)generate .ppu_compat in output_directory.
+        inject_compat_include: If True, prepend the .ppu_compat wrapper
+            include to converted headers (see sailify()).
+        inject_compat_include_ignores: Glob patterns of headers exempt from
+            the injection (see sailify()).
 
     Returns:
         Dict mapping absolute input path -> SailifyResult.
@@ -1179,6 +1259,8 @@ def sailify_extra_files_recursive(
             show_progress=show_detailed,
             project_directory=output_directory,
             backup=backup,
+            inject_compat_include=inject_compat_include,
+            inject_compat_include_ignores=inject_compat_include_ignores or [],
         )
         results[filepath] = res
         processed_count += 1

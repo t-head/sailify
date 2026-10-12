@@ -67,6 +67,18 @@ def main():
         "--ppu-compat-dir", type=str, default="",
         help="Directory for .ppu_compat headers (default: <output>/.ppu_compat).",
     )
+    parser.add_argument(
+        "--inject-compat-include", action="store_true", default=False,
+        help="Prepend '#include <.ppu_compat/compatible_wrapper.h>' to every converted "
+             "header (.h/.hpp/.cuh). The include search path must then point "
+             "at the parent of .ppu_compat (e.g. -I<output> instead of -I<output>/.ppu_compat).",
+    )
+    parser.add_argument(
+        "--inject-compat-include-ignore", dest="inject_compat_include_ignores",
+        nargs="*", default=None,
+        help="Glob patterns (relative to project root) of headers exempt from "
+             "--inject-compat-include. Repeatable.",
+    )
     # Version parameters
     parser.add_argument(
         "--cuda-version", type=str, default=None,
@@ -134,6 +146,8 @@ def main():
     custom_map_json = args.custom_map_json
     extra_mapping = args.extra_mapping
     backup = args.backup
+    inject_compat_include = args.inject_compat_include
+    inject_compat_include_ignores = args.inject_compat_include_ignores
     version_config = {}
     ppu_sdk_version_raw = None
 
@@ -155,6 +169,13 @@ def main():
         includes = cfg.get("includes")
         ignores = cfg.get("ignores")
         backup = cfg.get("backup", backup)
+        inject_compat_include = inject_compat_include or bool(
+            cfg.get("inject_compat_include", False)
+        )
+        if inject_compat_include_ignores is None:
+            inject_compat_include_ignores = cfg.get(
+                "inject_compat_include_ignores", []
+            )
         if "custom_map_json" in cfg and cfg["custom_map_json"]:
             custom_map_json = os.path.join(config_dir, cfg["custom_map_json"])
         if "extra_mapping" in cfg and cfg["extra_mapping"]:
@@ -225,6 +246,8 @@ def main():
         backup=backup,
         install_ppu_compat=args.install_ppu_compat,
         ppu_compat_dir=args.ppu_compat_dir or "",
+        inject_compat_include=inject_compat_include,
+        inject_compat_include_ignores=inject_compat_include_ignores,
         verbose=args.verbose,
         ppu_sdk_version=ppu_sdk_version,
     )

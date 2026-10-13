@@ -23,8 +23,9 @@
  * Phase 1: Pre-include fixes
  * ═══════════════════════════════════════════════════════════════════════ */
 
-/* hgcc does not implicitly include <functional> in C++ mode. */
-#if defined(__cplusplus)
+/* hgcc does not implicitly include <functional> in C++ mode; hgrtc
+ * (device-only RTC) has no host standard library at all. */
+#if defined(__cplusplus) && !defined(__HGGCCC_RTC__)
 #include <functional>
 #endif
 
@@ -38,8 +39,12 @@
  * ═══════════════════════════════════════════════════════════════════════ */
 #ifdef PPU_SDK_FIXUPS_POST
 
-/* PPU SDK has no cufile.h. */
+/* Device-safe: PPU SDK has no cufile.h — keep host/device macro state
+ * consistent when the same -DUSE_CUFILE is forwarded to hgrtc. */
 #undef USE_CUFILE
+
+/* Host-only: needs SDK headers or the host standard library. */
+#if !defined(__HGGCCC_RTC__)
 
 /* Missing acdnnFraction_t type. */
 typedef struct acdnnFractionStruct {
@@ -446,10 +451,12 @@ static inline acblasStatus_t acblasGemmStridedBatchedEx(acblasHandle_t handle,
 #endif /* PPU_SDK_VERSION < 20200 */
 
 #endif /* __cplusplus */
+#endif /* !__HGGCCC_RTC__ */
 
 /* PPU SDK's hggc/functional port lacks hggc::maximum / hggc::minimum
  * (CCCL cuda::maximum / cuda::minimum, which sailify maps onto).  < 20300
- * keeps the shim for every 2.2.x patch release. */
+ * keeps the shim for every 2.2.x patch release.  Device-safe, so it
+ * also stays visible under RTC. */
 #if defined(__cplusplus) && (PPU_SDK_VERSION < 20300)
 #ifndef __host__
 #define __host__ __attribute__((host))

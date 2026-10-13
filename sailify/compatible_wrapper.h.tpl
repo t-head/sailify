@@ -125,7 +125,13 @@
 #  define COMPAT_WRAPPER_HAS_PPU_SDK
 #endif
 
-#if defined(COMPAT_WRAPPER_HAS_PPU_SDK)
+#if defined(__HGGCCC_RTC__) && defined(COMPAT_WRAPPER_HAS_PPU_SDK)
+
+/* Device-only RTC: macros above + device-safe fixups only. */
+#define PPU_SDK_FIXUPS_POST
+#include "ppu_sdk_fixups.h"
+
+#elif defined(COMPAT_WRAPPER_HAS_PPU_SDK)
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -335,6 +341,6 @@ static inline acsolverStatus_t compatibleSolverGetProperty(hggcLibraryPropertyTy
 
 #endif /* __cplusplus */
 
-#endif /* COMPAT_WRAPPER_HAS_PPU_SDK */
+#endif /* __HGGCCC_RTC__ / COMPAT_WRAPPER_HAS_PPU_SDK */
 
 #endif /* COMPATIBLE_WRAPPER_H */

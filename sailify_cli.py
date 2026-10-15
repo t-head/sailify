@@ -27,6 +27,14 @@ def main():
         help="Where to write converted files (default: in-place).",
     )
     parser.add_argument(
+        "--derived-tree", type=str, default=None, metavar="JSON",
+        help="Derived tree: keep the original tree intact and write "
+             "converted sources with renamed dir components into a "
+             "mirrored tree.  JSON with a required "
+             '"rename" map, e.g. \'{"rename": {"cuda": "sail"}}\'; optional '
+             "keys: file_roots, include_roots.",
+    )
+    parser.add_argument(
         "--excludes", nargs="*", default=[],
         help="Directories to exclude from conversion (relative to project root).",
     )
@@ -234,6 +242,13 @@ def main():
     # Run conversion
     from sailify.sailify_python import sailify
 
+    derived_tree = None
+    if args.derived_tree:
+        try:
+            derived_tree = json.loads(args.derived_tree)
+        except json.JSONDecodeError as e:
+            parser.error(f"--derived-tree is not valid JSON: {e}")
+
     results = sailify(
         project_directory=project_directory,
         output_directory=output_directory or "",
@@ -250,6 +265,7 @@ def main():
         inject_compat_include_ignores=inject_compat_include_ignores,
         verbose=args.verbose,
         ppu_sdk_version=ppu_sdk_version,
+        derived_tree=derived_tree,
     )
 
     # Summary

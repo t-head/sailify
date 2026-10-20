@@ -1,2 +1,4 @@
 __pycache__/
 sailify.egg-info/
+build/
+dist/

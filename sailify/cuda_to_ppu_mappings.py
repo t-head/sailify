@@ -503,6 +503,34 @@ CUDA_TYPE_NAME_MAP = collections.OrderedDict([
     ("__nv_cvt_halfraw2_to_fp8x2", "__hg_cvt_halfraw2_to_fp8x2"),
     ("__nv_cvt_fp8_to_halfraw", "__hg_cvt_fp8_to_halfraw"),
     ("__nv_cvt_fp8x2_to_halfraw2", "__hg_cvt_fp8x2_to_halfraw2"),
+    # cuda_fp4.h: the PPU SDK has no fp4 header; sailify ships hggc_fp4.h
+    # (.ppu_compat) with these __hg_* spellings.
+    ("__nv_fp4_storage_t", "__hg_fp4_storage_t"),
+    ("__nv_fp4x2_storage_t", "__hg_fp4x2_storage_t"),
+    ("__nv_fp4x4_storage_t", "__hg_fp4x4_storage_t"),
+    ("__nv_fp4_e2m1", "__hg_fp4_e2m1"),
+    ("__nv_fp4x2_e2m1", "__hg_fp4x2_e2m1"),
+    ("__nv_fp4x4_e2m1", "__hg_fp4x4_e2m1"),
+    ("__nv_fp4_interpretation_t", "__hg_fp4_interpretation_t"),
+    ("__NV_E2M1", "__HG_E2M1"),
+    ("__nv_cvt_float_to_fp4", "__hg_cvt_float_to_fp4"),
+    ("__nv_cvt_float2_to_fp4x2", "__hg_cvt_float2_to_fp4x2"),
+    ("__nv_cvt_double_to_fp4", "__hg_cvt_double_to_fp4"),
+    ("__nv_cvt_double2_to_fp4x2", "__hg_cvt_double2_to_fp4x2"),
+    ("__nv_cvt_halfraw_to_fp4", "__hg_cvt_halfraw_to_fp4"),
+    ("__nv_cvt_halfraw2_to_fp4x2", "__hg_cvt_halfraw2_to_fp4x2"),
+    ("__nv_cvt_bfloat16raw_to_fp4", "__hg_cvt_bfloat16raw_to_fp4"),
+    ("__nv_cvt_bfloat16raw2_to_fp4x2", "__hg_cvt_bfloat16raw2_to_fp4x2"),
+    ("__nv_cvt_fp4_to_halfraw", "__hg_cvt_fp4_to_halfraw"),
+    ("__nv_cvt_fp4x2_to_halfraw2", "__hg_cvt_fp4x2_to_halfraw2"),
+    ("__CUDA_FP4_TYPES_EXIST__", "__HGGC_FP4_TYPES_EXIST__"),
+    # enum cudaRoundMode (device_types.h), the rounding argument of the
+    # fp8 e8m0 / fp4 converts; hgrt/hggc_device_types.h has hggcRoundMode.
+    ("cudaRoundMode", "hggcRoundMode"),
+    ("cudaRoundNearest", "hggcRoundNearest"),
+    ("cudaRoundZero", "hggcRoundZero"),
+    ("cudaRoundPosInf", "hggcRoundPosInf"),
+    ("cudaRoundMinInf", "hggcRoundMinInf"),
     # cuda_fp16.h typedefs the __nv_half* names to the __half* types; the
     # PPU SDK (hggc_fp16.h) only provides the __half* spellings.
     ("__nv_half", "__half"),

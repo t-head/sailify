@@ -333,6 +333,82 @@ def test_sdk22_state_resolved_with_compat_disabled(tmp):
     return failures
 
 
+_RT_VERSIONED_CASES = [
+    ("cudaStreamGetCaptureInfo_v2(stream, &st, &id);", "hggcStreamGetCaptureInfo_v2("),
+    ("cudaStreamGetCaptureInfo_v3(stream, &st, &id, &g, &deps, &edges, &n);", "hggcStreamGetCaptureInfo_v3("),
+    ("cudaGraphGetEdges_v2(g, from, to, ed, &n);", "hggcGraphGetEdges_v2("),
+    ("cudaGraphNodeGetDependencies_v2(node, deps, ed, &n);", "hggcGraphNodeGetDependencies_v2("),
+    ("cudaGraphNodeGetDependentNodes_v2(node, deps, ed, &n);", "hggcGraphNodeGetDependentNodes_v2("),
+    ("cudaGraphAddDependencies_v2(g, from, to, ed, n);", "hggcGraphAddDependencies_v2("),
+    ("cudaGraphRemoveDependencies_v2(g, from, to, ed, n);", "hggcGraphRemoveDependencies_v2("),
+    ("cudaGraphAddNode_v2(&node, g, deps, ed, n, &params);", "hggcGraphAddNode_v2("),
+    ("cudaGetDeviceProperties_v2(&prop, 0);", "hggcGetDeviceProperties_v2("),
+    ("cudaEventElapsedTime_v2(&ms, a, b);", "hggcEventElapsedTime_v2("),
+    ("cudaMemPrefetchAsync_v2(p, n, loc, 0, stream);", "hggcMemPrefetchAsync_v2("),
+    ("cudaMemAdvise_v2(p, n, advice, loc);", "hggcMemAdvise_v2("),
+    ("cudaStreamUpdateCaptureDependencies_v2(stream, deps, ed, n, cudaStreamSetCaptureDependencies);",
+     "hggcStreamUpdateCaptureDependencies_v2("),
+    ("cudaStreamUpdateCaptureDependencies_v2(stream, deps, ed, n, cudaStreamSetCaptureDependencies);",
+     "hggcStreamSetCaptureDependencies)"),
+    ("params.type = cudaGraphNodeTypeConditional;", "hggcGraphNodeTypeConditional"),
+    ("params.conditional.type = cudaGraphCondTypeIf;", "hggcGraphCondTypeIf"),
+    ("cudaSignalExternalSemaphoresAsync_v2(sems, params, n, stream);", "hggcSignalExternalSemaphoresAsync_v2("),
+    ("cudaWaitExternalSemaphoresAsync_v2(sems, params, n, stream);", "hggcWaitExternalSemaphoresAsync_v2("),
+    ("cudaLaunchHostFunc_v2(stream, fn, data, 0);", "hggcLaunchHostFunc_v2("),
+    ("cudaGraphConditionalHandleCreate_v2(&h, g, ctx, 0, 0);", "hggcGraphConditionalHandleCreate_v2("),
+    ("desc.f = cudaChannelFormatKindFloat;", "hggcChannelFormatKindFloat"),
+    ("cudaJitOption opt = cudaJitMaxRegisters;", "hggcJitMaxRegisters"),
+    ("cudaDeviceGetAttribute(&v, cudaDevAttrMaxTexture2DWidth, 0);", "hggcDevAttrMaxTexture2DWidth"),
+    ("attr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;", "HG_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION"),
+    ("cudaKernelNodeParamsV2 p2; cudaMemcpyNodeParams m2;", "hggcKernelNodeParamsV2"),
+    ("cudaGreenCtxCreate(&gctx, 0);", "hggcGreenCtxCreate("),
+    ("cuLogicalEndpointCreate(&ep, 0, 0);", "hgLogicalEndpointCreate("),
+    ("unsigned int t = cudaTextureType2D;", "hggcTextureType2D"),
+]
+
+_RT_DRIVER_CASES = [
+    ("cuLaunchHostFunc_v2(ctx, stream, fn, data, 0);", "hgLaunchHostFunc_v2("),
+    ("cuMulticastBindMem_v2(mc, dptr, 0, 0);", "hgMulticastBindMem_v2("),
+    ("cuMulticastBindAddr_v2(mc, &addr, 0);", "hgMulticastBindAddr_v2("),
+]
+
+
+def _rt_convert(sp, tmp, text, name):
+    src = os.path.join(tmp, name)
+    with open(src, "w") as fh:
+        fh.write(text + "\n")
+    res = sp.preprocessor(
+        output_directory=tmp,
+        filepath=src,
+        all_files=[],
+        stats={},
+        clean_ctx=None,
+        show_progress=False,
+        project_directory=tmp,
+    )
+    if res.status != "ok":
+        return None
+    with open(src) as fh:
+        return fh.read()
+
+
+def test_versioned_runtime_api_conversion(tmp):
+    import sailify.sailify_python as sp
+
+    failures = []
+    for i, (src, expected) in enumerate(_RT_VERSIONED_CASES):
+        got = _rt_convert(sp, tmp, src, "rt_ver_%d.cu" % i)
+        if got is None:
+            failures.append("preprocessor failed for: " + src)
+        elif expected not in got:
+            failures.append(src + " did not produce " + expected + ": " + got.strip())
+    for i, (src, expected) in enumerate(_RT_DRIVER_CASES):
+        got = _rt_convert(sp, tmp, src, "rt_drv_%d.cu" % i)
+        if got is None or expected not in got:
+            failures.append(src + " did not produce " + expected)
+    return failures
+
+
 def test_nvcc_flag_mapping():
     out = translate([
         "-c", "-O2", "-std=c++17", "-t=0",
@@ -377,6 +453,7 @@ def main(argv):
             ("sglang_aot_preprocessor_direct", lambda: test_sglang_aot_preprocessor_direct(tmp)),
             ("sdk22_mapping_state_toggles_with_version", test_sdk22_mapping_state_toggles_with_version),
             ("sdk22_state_resolved_with_compat_disabled", lambda: test_sdk22_state_resolved_with_compat_disabled(tmp)),
+            ("versioned_runtime_api_conversion", lambda: test_versioned_runtime_api_conversion(tmp)),
             ("nvcc_flag_mapping", test_nvcc_flag_mapping),
         ]:
             try:

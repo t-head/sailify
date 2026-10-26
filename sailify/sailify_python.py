@@ -22,7 +22,7 @@ import shutil
 import logging
 import fnmatch
 from enum import Enum
-from typing import Iterable, Iterator, Optional, Dict, List
+from typing import Iterable, Iterator, Optional, Dict, List, Tuple
 
 from .cuda_to_ppu_mappings import (
     CUDA_TO_PPU_MAPPINGS,
@@ -33,6 +33,7 @@ from .ppu_sdk_version import (
     detect_ppu_sdk_version,
     detect_runtime_api_version,
     format_version_string,
+    ppu_sdk_include_dirs,
     version_to_int,
 )
 
@@ -383,29 +384,265 @@ _SDK_2_2_VERSION_INT = 20200  # version_to_int((2, 2, 0))
 
 _SDK22_MAP: Dict[str, str] = {}
 _SDK22_RE: Optional[re.Pattern] = None
+# (include-dirs key, frozenset of identifiers the SDK declares): keyed by the
+# include roots so swapping the SDK env (or a test faking one) re-probes.
+_SDK22_PROBED: Optional[Tuple[Tuple[str, ...], frozenset]] = None
+
+
+def _probe_sdk22_identifiers(targets) -> frozenset:
+    """Which of `targets` the active PPU SDK actually declares.
+
+    The 2.2-era identifier map rewrites CUDA spellings to __hggc_ ones, but
+    whether an SDK ships the prefixed or the unprefixed spelling is a layout
+    property, not a version property: wt_v3's 2.2 SDK declares the
+    __hggc_ bf16/pipeline intrinsics in regular TUs, while other 2.3-era
+    SDKs declare only the unprefixed CUDA names there.  Rewriting towards a
+    spelling the SDK does not provide would produce undeclared-identifier
+    errors (exactly what the flat-layout SDKs show), so each pair activates
+    only when its target identifier appears in the SDK's headers.  Probe
+    result is cached per include-dirs tuple until the map is reset.
+    """
+    global _SDK22_PROBED
+    dirs = tuple(ppu_sdk_include_dirs())
+    if _SDK22_PROBED is not None and _SDK22_PROBED[0] == dirs:
+        return _SDK22_PROBED[1]
+    found = set()
+    remaining = set(targets)
+    if remaining:
+        blob_re = re.compile(
+            b"(?<!\\w)(" + b"|".join(sorted(re.escape(t.encode()) for t in remaining))
+            + b")(?!\\w)"
+        )
+        for include_dir in dirs:
+            for dirpath, _dirnames, filenames in os.walk(include_dir):
+                for name in filenames:
+                    if not name.endswith((".h", ".hpp")):
+                        continue
+                    try:
+                        with open(os.path.join(dirpath, name), "rb") as fh:
+                            blob = fh.read()
+                    except OSError:
+                        continue
+                    for m in blob_re.finditer(blob):
+                        found.add(m.group(0).decode())
+                    if targets <= found:
+                        break
+                if targets <= found:
+                    break
+    _SDK22_PROBED = (dirs, frozenset(found))
+    return _SDK22_PROBED[1]
 
 
 def _enable_sdk_2_2_mappings() -> None:
-    """Activate the PPU SDK >= 2.2 identifier group (idempotent)."""
+    """Activate the PPU SDK >= 2.2 identifier group (idempotent).
+
+    Pairs whose __hggc_/__HG_ target the active SDK does not declare stay
+    off (the CUDA spelling keeps compiling there)."""
     global _SDK22_MAP, _SDK22_RE
-    if _SDK22_RE is not None:
-        return
+    available = _probe_sdk22_identifiers(set(PPU_SDK_2_2_IDENTIFIER_MAP.values()))
     trie = Trie()
     mapping = {}
+    skipped = []
     for src, dst in PPU_SDK_2_2_IDENTIFIER_MAP.items():
-        trie.add(src)
-        mapping[src] = dst
+        if dst in available:
+            trie.add(src)
+            mapping[src] = dst
+        else:
+            skipped.append(src)
+    if skipped:
+        log.info(
+            "PPU SDK does not declare %d of the 2.2-era target spellings; "
+            "keeping the CUDA names for: %s",
+            len(skipped), ", ".join(sorted(skipped)[:8]) + (", ..." if len(skipped) > 8 else ""),
+        )
     _SDK22_MAP = mapping
-    _SDK22_RE = re.compile(r"(?<!\w)(" + trie.export_to_regex() + r")(?!\w)")
+    _SDK22_RE = (
+        re.compile(r"(?<!\w)(" + trie.export_to_regex() + r")(?!\w)")
+        if mapping else None
+    )
+    _enable_sail_include_prefixes()
 
 
 def _maybe_enable_sdk_2_2_mappings(ppu_sdk_version) -> None:
-    global _SDK22_MAP, _SDK22_RE
+    global _SDK22_MAP, _SDK22_RE, _SDK22_PROBED
     if ppu_sdk_version is not None and version_to_int(ppu_sdk_version) >= _SDK_2_2_VERSION_INT:
         _enable_sdk_2_2_mappings()
     else:
         _SDK22_MAP = {}
         _SDK22_RE = None
+        _SDK22_PROBED = None
+
+
+# ── sail-nested cccl layout (wt_v3-era PPU SDKs) ──────────────────────
+
+# wt_v3-era SDKs nest the cccl headers (thrust/cub/cooperative_groups, and
+# the hggc libcu++ port once the SDK ships it there) under
+# <SDK>/include/sail/ instead of the include root.  The include rewriter
+# prefixes those families with "sail/" so converted sources need no
+# build-system -I workaround.  Families activate only when the SDK actually
+# provides <sail>/<family>; #include <sail/...> paths are left untouched.
+# The SDK compiles those headers inside `namespace sail` (its
+# wrapped-namespace default), so the namespace rewriter below also
+# prefixes the identifiers themselves — converted code speaks
+# sail::thrust / sail::cub / sail::cooperative_groups directly instead of
+# relying on global-namespace aliases in ppu_sdk_fixups.h.
+_SAIL_INCLUDE_FAMILIES: tuple = ()
+_CANDIDATE_SAIL_FAMILIES = ("thrust", "cub", "cooperative_groups", "hggc")
+_SAIL_NS_FAMILIES = ("thrust", "cub", "cooperative_groups")
+_SAIL_NS_COMBINED_RE = None
+
+# CUDA core headers that wt_v3-era PPU SDKs ship only with the __hggc_
+# spelling (hggc_vector_types.h, ...), while older/other layouts provide the
+# unprefixed CUDA names.  Activated per pair only when the SDK include tree
+# has the prefixed file but not the unprefixed one, so flat-layout SDKs
+# (which provide the CUDA names natively and may lack the hggc_ ones) are
+# never rewritten.
+_PREFIXED_INCLUDE_MAP: Dict[str, str] = {}
+
+
+def _enable_prefixed_core_includes() -> None:
+    """Probe the SDK for CUDA core headers available only as hggc_*."""
+    global _PREFIXED_INCLUDE_MAP
+    if _PREFIXED_INCLUDE_MAP:
+        return
+    from .cuda_to_ppu_mappings import PPU_SDK_PREFIXED_CORE_HEADERS
+
+    mapping = {}
+    for bare, prefixed in PPU_SDK_PREFIXED_CORE_HEADERS.items():
+        for include_dir in ppu_sdk_include_dirs():
+            has_prefixed = os.path.isfile(os.path.join(include_dir, prefixed))
+            has_bare = os.path.isfile(os.path.join(include_dir, bare))
+            if has_prefixed:
+                if not has_bare:
+                    mapping[bare] = prefixed
+                break
+    _PREFIXED_INCLUDE_MAP = mapping
+    if mapping:
+        log.info(
+            "PPU SDK ships CUDA core headers only as hggc_*: %s",
+            ", ".join(mapping),
+        )
+
+
+def _enable_sail_include_prefixes() -> None:
+    """Probe the SDK for <sail>/<family> headers and activate prefixes."""
+    global _SAIL_INCLUDE_FAMILIES
+    if _SAIL_INCLUDE_FAMILIES:
+        return
+    families = []
+    for include_dir in ppu_sdk_include_dirs():
+        for fam in _CANDIDATE_SAIL_FAMILIES:
+            if fam in families:
+                continue
+            sail_dir = os.path.join(include_dir, "sail")
+            if os.path.isdir(os.path.join(sail_dir, fam)) or os.path.isfile(
+                os.path.join(sail_dir, fam + ".h")
+            ):
+                families.append(fam)
+    _SAIL_INCLUDE_FAMILIES = tuple(families)
+    if _SAIL_INCLUDE_FAMILIES:
+        log.info(
+            "PPU SDK nests headers under sail/: #include paths of %s get "
+            "a sail/ prefix",
+            ", ".join(_SAIL_INCLUDE_FAMILIES),
+        )
+    _enable_prefixed_core_includes()
+    _enable_sail_namespace_rewrites()
+
+
+def _enable_sail_namespace_rewrites() -> None:
+    """Namespace-resolve the cccl families the SDK nests under sail/.
+
+    Activated only for families whose headers live under <sail>/ (flat-layout
+    SDKs keep the global namespaces and must not be rewritten).  The rewrite
+    is context-scoped — plain identifiers named thrust/cub stay untouched
+    (actlize uses `cub` as an integer loop variable) — covering only ROOT
+    references:
+
+      ::cub::x / cub::x            root-qualified uses
+      ::cub                        root uses in macro arguments etc.
+      namespace cub ...            namespace definitions, forwards, aliases,
+                                   `using namespace cub`
+      namespace cg = cooperative_groups;
+                                   alias declarations of the whole namespace
+
+    Nested qualifications (cuda::cub, at_cuda_detail::cub, foo::thrust) are
+    left alone: the family is a member of the enclosing namespace there, and
+    whether that enclosing namespace is a CUB_WRAPPED_NAMESPACE-style project
+    namespace or a to-be-renamed persona namespace is project knowledge the
+    token-level rewrite cannot have.  Redirecting them would guess wrong in
+    at least the wrapped-namespace case (W::cub is already the correct
+    reference; rewriting it produces W::sail::cub).  Such pairs belong in the
+    project's extra_mapping.  Note `ROCM_HIPCUB(::cub)` still matches: the
+    `::cub` there is preceded by `(`, not an identifier/`::`, so it is a root
+    reference and does get rewritten.
+
+    #include paths, comments and string literals are masked out by the
+    caller's masked sweep.  The rewrite is idempotent (a reference already
+    prefixed with sail:: is preceded by : or a word char and so never
+    matches), so the conversion can re-run on already-staged sources.
+
+    Rewrites are emitted with a LEADING :: (::sail::cub::x, not
+    sail::cub::x): converted torch hosts its own sail persona namespaces
+    (c10::sail, at::sail), and an unqualified sail:: inside namespace c10
+    would wrongly resolve to c10::sail.  A real namespace-definition cannot
+    start with :: (C++ grammar), so that form alone keeps the unqualified
+    spelling — valid at global scope, where such definitions live.
+    """
+    global _SAIL_NS_COMBINED_RE
+    if _SAIL_NS_COMBINED_RE is not None:
+        return
+    fams = [f for f in _SAIL_NS_FAMILIES if f in _SAIL_INCLUDE_FAMILIES]
+    if not fams:
+        return
+    fam = "|".join(re.escape(f) for f in fams)
+    _SAIL_NS_COMBINED_RE = re.compile(
+        r"(?<![\w:])(?P<q1>%(fam)s)::"
+        r"|(?<![\w:])::(?P<q2>%(fam)s)(?!\w)"
+        r"|(?P<using>using\s+)?namespace\s+(?P<decl>%(fam)s)\b(?!\s*=)"
+        r"|namespace\s+(?P<alias>\w+)\s*=\s*(?P<rhs>%(fam)s)\s*;"
+        % {"fam": fam}
+    )
+    log.info(
+        "Converted sources reference %s directly (source-level "
+        "namespace resolution)",
+        ", ".join("::sail::" + fam for fam in fams),
+    )
+
+
+def _sail_ns_repl(match) -> str:
+    if match.group("q1") is not None:
+        return "::sail::" + match.group("q1") + "::"
+    if match.group("q2") is not None:
+        return "::sail::" + match.group("q2")
+    if match.group("decl") is not None:
+        if match.group("using") is not None:
+            return "using namespace ::sail::" + match.group("decl")
+        return "namespace sail::" + match.group("decl")
+    return "namespace %s = ::sail::%s;" % (
+        match.group("alias"), match.group("rhs"))
+
+
+def _sub_masked(pattern, repl, source: str, mask: str) -> str:
+    """re.sub, but only where the pre-computed mask is not 'x'."""
+    parts: List[str] = []
+    last = 0
+    for m in pattern.finditer(source):
+        if mask[m.start()] == 'x':
+            continue
+        parts.append(source[last:m.start()])
+        parts.append(repl(m))
+        last = m.end()
+    if not parts:
+        return source
+    parts.append(source[last:])
+    return "".join(parts)
+
+
+# Post-trie repairs for wrapper idioms that compose the wrapped-namespace
+# name out of macro pieces (torch's cub wrapper, -DCUB_WRAPPED_NAMESPACE=
+# at_cuda_detail) live in the project's extra-mapping file, not here:
+# they are project-specific string replacements applied after this step.
 
 
 # ── Custom mapping support ────────────────────────────────────────────
@@ -683,8 +920,14 @@ def _copy_derived_files(project_directory: str, output_directory: str,
             shutil.copyfile(path, dst)
 
 
-def _mask_comments_and_strings(source: str) -> str:
-    """Mask comments and char literals with 'x' to gate identifier replacement."""
+def _mask_comments_and_strings(source: str, mask_strings: bool = False) -> str:
+    """Mask comments and char literals with 'x' to gate identifier replacement.
+
+    String-literal contents stay unmasked by default (the CUDA identifier
+    passes have always rewritten them); *mask_strings* additionally masks
+    string contents — the sail:: namespace rewriter uses it so prose like
+    error messages keeps the stock spellings.
+    """
     n = len(source)
     in_include = [False] * n
     line_start = 0
@@ -808,12 +1051,12 @@ def _mask_comments_and_strings(source: str) -> str:
                 result.append(c)
                 i += 1
                 if i < n:
-                    result.append(source[i])
+                    result.append('x' if mask_strings else source[i])
                     i += 1
                 continue
             if c == '"':
                 in_context = ''
-            result.append(c)
+            result.append('x' if mask_strings else c)
             i += 1
 
         elif in_context == "'":
@@ -902,6 +1145,26 @@ def _rewrite_include_directives(source: str, derived_tree: Optional[dict] = None
                         new_path = new_path[:last_slash + 1] + ppu_path
                     else:
                         new_path = ppu_path
+
+        # SDK-nested cccl families (wt_v3 layout): prefix with sail/ so the
+        # include resolves under <SDK>/include/sail/.  Inactive on
+        # flat-layout SDKs (_SAIL_INCLUDE_FAMILIES stays empty).
+        for fam in _SAIL_INCLUDE_FAMILIES:
+            if (new_path == fam or new_path.startswith(fam + "/")
+                    or new_path.startswith(fam + ".")):
+                new_path = "sail/" + new_path
+                break
+
+        # CUDA core headers the SDK ships only as hggc_* (wt_v3 layout).
+        # Same filename-component matching as the bare CUDA_INCLUDE_MAP
+        # keys above, so subdirectory includes keep their directory.
+        for bare, prefixed in _PREFIXED_INCLUDE_MAP.items():
+            last_slash = new_path.rfind('/')
+            filename = new_path[last_slash + 1:] if last_slash >= 0 else new_path
+            if filename == bare:
+                new_path = (new_path[:last_slash + 1] if last_slash >= 0
+                            else "") + prefixed
+                break
         return prefix + new_path + suffix
 
     return _inc_re.sub(_replace, source)
@@ -1016,6 +1279,20 @@ def preprocessor(
             _last_end = _m.end()
         _new_parts.append(output_source[_last_end:])
         output_source = "".join(_new_parts)
+
+    # 2c. Namespace-resolve the cccl families the SDK nests under sail/
+    # (sail::thrust, sail::cub, ...); inactive on flat-layout SDKs.  The
+    # combined regex only fires in namespace contexts (fam::, ::fam,
+    # namespace fam, namespace x = fam;), so ordinary identifiers named
+    # `cub`/`thrust` (actlize loop variables) pass through untouched.
+    # Strings are masked here so error-message prose keeps stock spellings.
+    # Project-specific post-trie fixes (e.g. torch's at_cuda_detail cub
+    # wrapper idioms) belong in the extra-mapping list applied below.
+    if _SAIL_NS_COMBINED_RE is not None:
+        _masked_ns = _mask_comments_and_strings(output_source, mask_strings=True)
+        output_source = _sub_masked(
+            _SAIL_NS_COMBINED_RE, _sail_ns_repl, output_source, _masked_ns
+        )
 
     for _pat, _repl in _EXTRA_MAPPING_LISTS:
         output_source = output_source.replace(_pat, _repl)

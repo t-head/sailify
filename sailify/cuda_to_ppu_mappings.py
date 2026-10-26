@@ -11639,6 +11639,89 @@ PPU_SDK_2_2_IDENTIFIER_MAP = collections.OrderedDict([
     ("__NV_THREAD_SCOPE_CLUSTER", "__HG_THREAD_SCOPE_CLUSTER"),
     ("__NV_THREAD_SCOPE_DEVICE", "__HG_THREAD_SCOPE_DEVICE"),
     ("__NV_THREAD_SCOPE_SYSTEM", "__HG_THREAD_SCOPE_SYSTEM"),
+    # wt_v3-era PPU SDKs spell the bfloat16 conversion/reinterpret and the
+    # pipeline intrinsics with the __hggc_ prefix in regular TUs (the
+    # unprefixed CUDA spellings exist only under __HGGCCC_RTC__ there).
+    # Other SDKs of the same generation keep the unprefixed CUDA names and
+    # ship no __hggc_ variants, so which spelling is valid is a layout
+    # property, not a version property: sailify probes the SDK headers and
+    # activates a pair only when its __hggc_ target is actually declared.
+    ("__double2bfloat16", "__hggc_double2bfloat16"),
+    ("__float2bfloat16", "__hggc_float2bfloat16"),
+    ("__float2bfloat16_rn", "__hggc_float2bfloat16_rn"),
+    ("__float2bfloat16_rz", "__hggc_float2bfloat16_rz"),
+    ("__float2bfloat16_rd", "__hggc_float2bfloat16_rd"),
+    ("__float2bfloat16_ru", "__hggc_float2bfloat16_ru"),
+    ("__bfloat162float", "__hggc_bfloat162float"),
+    ("__float2bfloat162_rn", "__hggc_float2bfloat162_rn"),
+    ("__floats2bfloat162_rn", "__hggc_floats2bfloat162_rn"),
+    ("__float22bfloat162_rn", "__hggc_float22bfloat162_rn"),
+    ("__bfloat1622float2", "__hggc_bfloat1622float2"),
+    ("__bfloat162char_rz", "__hggc_bfloat162char_rz"),
+    ("__bfloat162uchar_rz", "__hggc_bfloat162uchar_rz"),
+    ("__bfloat162int_rz", "__hggc_bfloat162int_rz"),
+    ("__int2bfloat16_rn", "__hggc_int2bfloat16_rn"),
+    ("__int2bfloat16_rz", "__hggc_int2bfloat16_rz"),
+    ("__int2bfloat16_rd", "__hggc_int2bfloat16_rd"),
+    ("__int2bfloat16_ru", "__hggc_int2bfloat16_ru"),
+    ("__bfloat162short_rz", "__hggc_bfloat162short_rz"),
+    ("__short2bfloat16_rn", "__hggc_short2bfloat16_rn"),
+    ("__short2bfloat16_rz", "__hggc_short2bfloat16_rz"),
+    ("__short2bfloat16_rd", "__hggc_short2bfloat16_rd"),
+    ("__short2bfloat16_ru", "__hggc_short2bfloat16_ru"),
+    ("__bfloat162uint_rz", "__hggc_bfloat162uint_rz"),
+    ("__uint2bfloat16_rn", "__hggc_uint2bfloat16_rn"),
+    ("__uint2bfloat16_rz", "__hggc_uint2bfloat16_rz"),
+    ("__uint2bfloat16_rd", "__hggc_uint2bfloat16_rd"),
+    ("__uint2bfloat16_ru", "__hggc_uint2bfloat16_ru"),
+    ("__bfloat162ushort_rz", "__hggc_bfloat162ushort_rz"),
+    ("__ushort2bfloat16_rn", "__hggc_ushort2bfloat16_rn"),
+    ("__ushort2bfloat16_rz", "__hggc_ushort2bfloat16_rz"),
+    ("__ushort2bfloat16_rd", "__hggc_ushort2bfloat16_rd"),
+    ("__ushort2bfloat16_ru", "__hggc_ushort2bfloat16_ru"),
+    ("__bfloat162ull_rz", "__hggc_bfloat162ull_rz"),
+    ("__ull2bfloat16_rn", "__hggc_ull2bfloat16_rn"),
+    ("__ull2bfloat16_rz", "__hggc_ull2bfloat16_rz"),
+    ("__ull2bfloat16_rd", "__hggc_ull2bfloat16_rd"),
+    ("__ull2bfloat16_ru", "__hggc_ull2bfloat16_ru"),
+    ("__bfloat162ll_rz", "__hggc_bfloat162ll_rz"),
+    ("__ll2bfloat16_rn", "__hggc_ll2bfloat16_rn"),
+    ("__ll2bfloat16_rz", "__hggc_ll2bfloat16_rz"),
+    ("__ll2bfloat16_rd", "__hggc_ll2bfloat16_rd"),
+    ("__ll2bfloat16_ru", "__hggc_ll2bfloat16_ru"),
+    ("__short_as_bfloat16", "__hggc_short_as_bfloat16"),
+    ("__ushort_as_bfloat16", "__hggc_ushort_as_bfloat16"),
+    # Same prefixed-spelling story for the pipeline primitives.
+    ("__pipeline_commit", "__hggc_pipeline_commit"),
+    ("__pipeline_wait_prior", "__hggc_pipeline_wait_prior"),
+    ("__pipeline_memcpy_async", "__hggc_pipeline_memcpy_async"),
+    ("__pipeline_arrive_on", "__hggc_pipeline_arrive_on"),
+])
+
+# CUDA core headers that some PPU SDK layouts (wt_v3-era) ship only with
+# the __hggc_ prefix.  Applied per detected SDK include tree: a pair is
+# activated only when the prefixed header exists and the unprefixed one
+# does not (see sailify_python._enable_prefixed_core_includes), so flat
+# layouts that provide the CUDA names natively are never rewritten.
+PPU_SDK_PREFIXED_CORE_HEADERS = collections.OrderedDict([
+    ("channel_descriptor.h", "hggc_channel_descriptor.h"),
+    ("driver_functions.h", "hggc_driver_functions.h"),
+    ("driver_types.h", "hggc_driver_types.h"),
+    ("host_defines.h", "hggc_host_defines.h"),
+    ("surface_types.h", "hggc_surface_types.h"),
+    ("texture_types.h", "hggc_texture_types.h"),
+    ("vector_functions.h", "hggc_vector_functions.h"),
+    ("vector_functions.hpp", "hggc_vector_functions.hpp"),
+    ("vector_types.h", "hggc_vector_types.h"),
+    ("sanitizer.h", "hggc_sanitizer.h"),
+    ("sanitizer_barrier.h", "hggc_sanitizer_barrier.h"),
+    ("sanitizer_callbacks.h", "hggc_sanitizer_callbacks.h"),
+    ("sanitizer_driver_cbid.h", "hggc_sanitizer_driver_cbid.h"),
+    ("sanitizer_memory.h", "hggc_sanitizer_memory.h"),
+    ("sanitizer_patching.h", "hggc_sanitizer_patching.h"),
+    ("sanitizer_result.h", "hggc_sanitizer_result.h"),
+    ("sanitizer_runtime_cbid.h", "hggc_sanitizer_runtime_cbid.h"),
+    ("sanitizer_stream.h", "hggc_sanitizer_stream.h"),
 ])
 
 CUDA_SPECIAL_MAP = collections.OrderedDict([

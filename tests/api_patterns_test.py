@@ -265,13 +265,24 @@ def test_sglang_aot_preprocessor_direct(tmp):
 def test_sdk22_mapping_state_toggles_with_version():
     import sailify.sailify_python as sp
 
+    # hermetic SDK: declares every 2.2-era target spelling
+    sdk_inc = os.path.join(tempfile.mkdtemp(prefix="sailify_sdk22_state_"), "include")
+    os.makedirs(sdk_inc, exist_ok=True)
+    with open(os.path.join(sdk_inc, "hggc_all.h"), "w") as fh:
+        for _src, dst in sp.PPU_SDK_2_2_IDENTIFIER_MAP.items():
+            fh.write("int %s;\n" % dst)
+
     failures = []
+    orig_dirs = sp.ppu_sdk_include_dirs
     try:
+        sp.ppu_sdk_include_dirs = lambda: [sdk_inc]
         sp._maybe_enable_sdk_2_2_mappings((2, 2, 0))
         if not sp._SDK22_MAP or sp._SDK22_RE is None:
             failures.append("SDK 2.2 mappings not enabled for version (2, 2, 0)")
         elif sp._SDK22_RE.search("__NV_THREAD_SCOPE_THREAD") is None:
             failures.append("SDK 2.2 regex does not match a mapped identifier")
+        elif len(sp._SDK22_MAP) != len(sp.PPU_SDK_2_2_IDENTIFIER_MAP):
+            failures.append("probe dropped pairs whose targets the fake SDK declares")
 
         sp._maybe_enable_sdk_2_2_mappings((2, 1, 5))
         if sp._SDK22_MAP or sp._SDK22_RE is not None:
@@ -285,7 +296,141 @@ def test_sdk22_mapping_state_toggles_with_version():
         if sp._SDK22_MAP or sp._SDK22_RE is not None:
             failures.append("SDK 2.2 mappings not reset for unknown version")
     finally:
+        sp.ppu_sdk_include_dirs = orig_dirs
         sp._maybe_enable_sdk_2_2_mappings(None)
+    return failures
+
+
+def test_sdk22_bf16_pipeline_spelling_rewrite(tmp):
+    import sailify.sailify_python as sp
+
+    src_dir = os.path.join(tmp, "sdk22_spelling")
+    os.makedirs(src_dir, exist_ok=True)
+    src = os.path.join(src_dir, "k.cu")
+
+    # wt_v3-style SDK: the __hggc_ spellings are the declared ones
+    wt_inc = os.path.join(tmp, "sdk_wt", "include")
+    os.makedirs(wt_inc, exist_ok=True)
+    with open(os.path.join(wt_inc, "hggc_bf16.hpp"), "w") as fh:
+        for name in ("__hggc_bfloat162float", "__hggc_float2bfloat16_rn",
+                     "__hggc_pipeline_commit", "__hggc_pipeline_wait_prior"):
+            fh.write("int %s;\n" % name)
+    # flat-style SDK: only the unprefixed CUDA spellings exist
+    flat_inc = os.path.join(tmp, "sdk_flat", "include")
+    os.makedirs(flat_inc, exist_ok=True)
+    with open(os.path.join(flat_inc, "hggc_bf16.hpp"), "w") as fh:
+        for name in ("__bfloat162float", "__float2bfloat16_rn",
+                     "__pipeline_commit", "__pipeline_wait_prior"):
+            fh.write("int %s;\n" % name)
+
+    def write_case():
+        with open(src, "w") as fh:
+            fh.write(
+                "float f(__ppu_bfloat16 a) { return __bfloat162float(a); }\n"
+                "int p; __pipeline_commit(); __pipeline_wait_prior(0);\n"
+                "auto q = __float2bfloat16_rn(1.0f);\n"
+                "int untouched = my__bfloat162float_x;\n"
+                "float nat = __low2float(a);\n"
+            )
+
+    failures = []
+    orig_dirs = sp.ppu_sdk_include_dirs
+    try:
+        # wt_v3 layout: CUDA spellings rewrite to the declared __hggc_ ones
+        sp.ppu_sdk_include_dirs = lambda: [wt_inc]
+        sp._maybe_enable_sdk_2_2_mappings((2, 2, 0))
+        write_case()
+        sp.sailify_extra_files(src_dir, [src], install_ppu_compat=False)
+        with open(src) as fh:
+            text = fh.read()
+        for cuda_name, ppu_name in (
+            ("__bfloat162float", "__hggc_bfloat162float"),
+            ("__pipeline_commit", "__hggc_pipeline_commit"),
+            ("__pipeline_wait_prior", "__hggc_pipeline_wait_prior"),
+            ("__float2bfloat16_rn", "__hggc_float2bfloat16_rn"),
+        ):
+            if ppu_name not in text:
+                failures.append("SDK 2.2 spelling rewrite missing: " + cuda_name)
+            if re.search(r"(?<!\w)" + re.escape(cuda_name) + r"(?!\w)", text):
+                failures.append("CUDA spelling survived: " + cuda_name)
+        if "my__bfloat162float_x" not in text:
+            failures.append("rewrite touched a partial identifier")
+        if "__low2float" not in text:
+            failures.append("rewrite altered a name the SDK provides unprefixed")
+
+        # flat layout: the __hggc_ targets are not declared, so the CUDA
+        # spellings must survive (rewriting would be an undeclared identifier)
+        sp.ppu_sdk_include_dirs = lambda: [flat_inc]
+        sp._maybe_enable_sdk_2_2_mappings((2, 2, 0))
+        write_case()
+        sp.sailify_extra_files(src_dir, [src], install_ppu_compat=False)
+        with open(src) as fh:
+            text = fh.read()
+        for cuda_name in ("__bfloat162float", "__pipeline_commit",
+                          "__pipeline_wait_prior", "__float2bfloat16_rn"):
+            if not re.search(r"(?<!\w)" + re.escape(cuda_name) + r"(?!\w)", text):
+                failures.append("flat-layout SDK lost the CUDA spelling: " + cuda_name)
+        if "__hggc_" in text:
+            failures.append("flat-layout SDK produced __hggc_ spellings")
+    finally:
+        sp.ppu_sdk_include_dirs = orig_dirs
+        sp._maybe_enable_sdk_2_2_mappings(None)
+    return failures
+
+
+def test_prefixed_core_include_probe(tmp):
+    import sailify.sailify_python as sp
+
+    sdk_inc = os.path.join(tmp, "sdk_include")
+    os.makedirs(sdk_inc, exist_ok=True)
+    src_dir = os.path.join(tmp, "prefixed_inc")
+    os.makedirs(src_dir, exist_ok=True)
+    src = os.path.join(src_dir, "k.cu")
+
+    def write_case():
+        with open(src, "w") as fh:
+            fh.write(
+                "#include <vector_types.h>\n"
+                "#include <driver_types.h>\n"
+                "#include <some_dir/vector_functions.h>\n"
+                "#include <vector_types.h.bak>\n"
+            )
+
+    failures = []
+    orig_dirs = sp.ppu_sdk_include_dirs
+    try:
+        # wt_v3 layout: only the hggc_* spellings exist.
+        sp.ppu_sdk_include_dirs = lambda: [sdk_inc]
+        sp._PREFIXED_INCLUDE_MAP = {}
+        for name in ("hggc_vector_types.h", "hggc_driver_types.h",
+                     "hggc_vector_functions.h"):
+            open(os.path.join(sdk_inc, name), "w").close()
+        sp._enable_prefixed_core_includes()
+        write_case()
+        sp.sailify_extra_files(src_dir, [src], install_ppu_compat=False)
+        with open(src) as fh:
+            text = fh.read()
+        for want in ("<hggc_vector_types.h>", "<hggc_driver_types.h>",
+                     "<some_dir/hggc_vector_functions.h>"):
+            if want not in text:
+                failures.append("prefixed include rewrite missing: " + want)
+        if "<vector_types.h>" in text:
+            failures.append("unprefixed vector_types.h survived")
+        if "<vector_types.h.bak>" not in text:
+            failures.append("rewrite touched a longer filename")
+
+        # Flat layout: the unprefixed CUDA names exist, nothing rewrites.
+        open(os.path.join(sdk_inc, "vector_types.h"), "w").close()
+        sp._PREFIXED_INCLUDE_MAP = {}
+        write_case()
+        sp.sailify_extra_files(src_dir, [src], install_ppu_compat=False)
+        with open(src) as fh:
+            text = fh.read()
+        if "<vector_types.h>" not in text:
+            failures.append("flat-layout SDK was rewritten anyway")
+    finally:
+        sp.ppu_sdk_include_dirs = orig_dirs
+        sp._PREFIXED_INCLUDE_MAP = {}
     return failures
 
 
@@ -360,6 +505,89 @@ def test_nvcc_flag_mapping():
     return failures
 
 
+def test_sail_ns_root_only_rewrite():
+    """Step-2c rewrites only ROOT cccl references; nested qualifications
+    (cuda::cub, at_cuda_detail::cub) are project knowledge and stay put."""
+    import sailify.sailify_python as sp
+
+    sdk_inc = tempfile.mkdtemp(prefix="sailify_ns_sdk_")
+    for fam in ("cub", "thrust", "cooperative_groups"):
+        os.makedirs(os.path.join(sdk_inc, "sail", fam), exist_ok=True)
+
+    failures = []
+    orig_dirs = sp.ppu_sdk_include_dirs
+    try:
+        sp.ppu_sdk_include_dirs = lambda: [sdk_inc]
+        sp._SAIL_INCLUDE_FAMILIES = ()
+        sp._SAIL_NS_COMBINED_RE = None
+        sp._enable_sail_include_prefixes()
+        if sp._SAIL_NS_COMBINED_RE is None:
+            return ["sail/ nested SDK did not activate the ns rewrite"]
+
+        def rewrite(text):
+            # all-spaces mask = apply everywhere (the caller masks
+            # comments/strings/includes; this test targets the regex itself)
+            return sp._sub_masked(
+                sp._SAIL_NS_COMBINED_RE, sp._sail_ns_repl, text, " " * len(text)
+            )
+
+        # root references get rewritten, with a leading ::
+        for src, want in (
+            ("cub::DeviceScan::SortPairs",
+             "::sail::cub::DeviceScan::SortPairs"),
+            ("::cub::Max()", "::sail::cub::Max()"),
+            ("auto v = ::cub::DeviceReduce::Sum;",
+             "auto v = ::sail::cub::DeviceReduce::Sum;"),
+            ("ROCM_HIPCUB(::cub)::Max()",
+             "ROCM_HIPCUB(::sail::cub)::Max()"),
+            ("namespace cub {", "namespace sail::cub {"),
+            ("using namespace cub;", "using namespace ::sail::cub;"),
+            ("namespace cg = cooperative_groups;",
+             "namespace cg = ::sail::cooperative_groups;"),
+            ("thrust::device_vector<int> v;",
+             "::sail::thrust::device_vector<int> v;"),
+        ):
+            got = rewrite(src)
+            if got != want:
+                failures.append("root rewrite %r -> %r (want %r)" % (src, got, want))
+
+        # nested qualifications are left alone: whether the enclosing
+        # namespace is a CUB_WRAPPED_NAMESPACE-style project namespace or a
+        # persona namespace the main conversion renames is not this step's
+        # to decide.
+        for keep in (
+            "namespace at::cuda::cub {",
+            "at_cuda_detail::cub::DeviceScan::InclusiveSum",
+            "ROCM_HIPCUB(at_cuda_detail::cub)::BlockLoad",
+            "namespace cub = ::at_cuda_detail::cub;",
+            "cuda::cub::x",
+            "int cub = 3;",
+            "for (int cub = 0; cub < n; ++cub)",
+        ):
+            got = rewrite(keep)
+            if got != keep:
+                failures.append("nested/plain %r rewritten to %r" % (keep, got))
+
+        # idempotent on already-rewritten output
+        once = rewrite("::cub::Max() ::thrust::foo namespace sail::cub {")
+        if rewrite(once) != once or "::sail::sail" in once:
+            failures.append("rewrite not idempotent: %r" % once)
+
+        # flat-layout SDK (no sail/ nesting): no rewrite machinery at all
+        flat_inc = tempfile.mkdtemp(prefix="sailify_ns_flat_")
+        sp.ppu_sdk_include_dirs = lambda: [flat_inc]
+        sp._SAIL_INCLUDE_FAMILIES = ()
+        sp._SAIL_NS_COMBINED_RE = None
+        sp._enable_sail_include_prefixes()
+        if sp._SAIL_NS_COMBINED_RE is not None:
+            failures.append("flat-layout SDK activated the ns rewrite")
+    finally:
+        sp.ppu_sdk_include_dirs = orig_dirs
+        sp._SAIL_INCLUDE_FAMILIES = ()
+        sp._SAIL_NS_COMBINED_RE = None
+    return failures
+
+
 def main(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true")
@@ -376,8 +604,11 @@ def main(argv):
             ("pytorch_cpp_extension_jit", lambda: test_pytorch_cpp_extension_jit(tmp)),
             ("sglang_aot_preprocessor_direct", lambda: test_sglang_aot_preprocessor_direct(tmp)),
             ("sdk22_mapping_state_toggles_with_version", test_sdk22_mapping_state_toggles_with_version),
+            ("sdk22_bf16_pipeline_spelling_rewrite", lambda: test_sdk22_bf16_pipeline_spelling_rewrite(tmp)),
+            ("prefixed_core_include_probe", lambda: test_prefixed_core_include_probe(tmp)),
             ("sdk22_state_resolved_with_compat_disabled", lambda: test_sdk22_state_resolved_with_compat_disabled(tmp)),
             ("nvcc_flag_mapping", test_nvcc_flag_mapping),
+            ("sail_ns_root_only_rewrite", test_sail_ns_root_only_rewrite),
         ]:
             try:
                 failures = fn()

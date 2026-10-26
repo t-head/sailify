@@ -17,6 +17,7 @@ __all__ = [
     "detect_ppu_sdk_version",
     "detect_runtime_api_version",
     "parse_version_string",
+    "ppu_sdk_include_dirs",
     "format_version_string",
     "version_to_int",
 ]
@@ -84,6 +85,35 @@ def _find_hgcc():
             if os.path.isfile(candidate):
                 return candidate
     return None
+
+
+def ppu_sdk_include_dirs():
+    """Candidate include roots of the active PPU SDK (best effort).
+
+    Preferred source is the PPU_SDK/PPU_HOME env (the SDK root the build
+    targets); falls back to the SDK root inferred from the located hgcc
+    (``<SDK>/bin/hgcc``).  Covers both flat ``<SDK>/include`` and the
+    device-side ``<SDK>/targets/x86_64-linux/include`` roots.  Used for
+    probing SDK layout features (e.g. the nested ``sail/`` header tree).
+    """
+    roots = []
+    for var in _SDK_ENV_VARS:
+        home = os.environ.get(var)
+        if home:
+            roots.append(os.path.join(home, "include"))
+            roots.append(os.path.join(home, "targets", "x86_64-linux", "include"))
+    hgcc = _find_hgcc()
+    if hgcc:
+        sdk_root = os.path.dirname(os.path.dirname(os.path.abspath(hgcc)))
+        roots.append(os.path.join(sdk_root, "include"))
+        roots.append(os.path.join(sdk_root, "targets", "x86_64-linux", "include"))
+    seen = set()
+    out = []
+    for d in roots:
+        if d not in seen and os.path.isdir(d):
+            seen.add(d)
+            out.append(d)
+    return out
 
 
 def _query_hgcc_version():

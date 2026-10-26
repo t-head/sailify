@@ -453,6 +453,7 @@ static inline acblasStatus_t acblasGemmStridedBatchedEx(acblasHandle_t handle,
 #endif /* __cplusplus */
 #endif /* !__HGGCCC_RTC__ */
 
+
 /* PPU SDK's hggc/functional port lacks hggc::maximum / hggc::minimum
  * (CCCL cuda::maximum / cuda::minimum, which sailify maps onto).  < 20300
  * keeps the shim for every 2.2.x patch release.  Device-safe, so it

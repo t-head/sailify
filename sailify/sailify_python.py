@@ -10,9 +10,10 @@ Implements:
 
 sailify only converts CUDA SDK identifiers (APIs, types, macros, header paths).
 It does NOT rename files or directories, and does NOT rewrite CMake or Python
-build scripts.
+build scripts.  The opt-in derived-tree mode is the one exception.
 """
 
+import glob
 import os
 import re
 import json
@@ -283,13 +284,13 @@ class CurrentState(Enum):
 class SailifyResult:
     """Result of processing a single file."""
 
-    def __init__(self, current_state: CurrentState, ppuified_path: str):
+    def __init__(self, current_state: CurrentState = None, sailified_path: str = ""):
         self.current_state = current_state
-        self.ppuified_path = ppuified_path
+        self.sailified_path = sailified_path
         self.status = ""
 
     def asdict(self):
-        return {"ppuified_path": self.ppuified_path, "status": self.status}
+        return {"sailified_path": self.sailified_path, "status": self.status}
 
 
 # ── Trie ──────────────────────────────────────────────────────────────
@@ -435,28 +436,51 @@ def update_custom_mappings(custom_map_list: str) -> None:
 
 # ── Extra mapping lists (from --extra-mapping config) ────────────────
 # A list of (pattern, replacement) string pairs applied AFTER the main
-# trie replacement step.  Loaded from a JSON file via --extra-mapping.
+# trie replacement step.  Loaded from a JSON file via --extra-mapping,
+# either as a flat JSON array of [from, to] pairs (applied to every
+# converted file) or as an object:
+#
+#     {"mappings": [[from, to], ...],          # every converted file
+#      "derived_mappings": [[from, to], ...]}  # only derived-tree files
 _EXTRA_MAPPING_LISTS = []
+_DERIVED_EXTRA_MAPPING_LISTS = []
 
 
 def load_extra_mappings(extra_mapping_path: str) -> None:
     """Load extra string-to-string mappings from a JSON file.
     Each pair is applied via ``str.replace`` on the post-trie source text.
     """
-    global _EXTRA_MAPPING_LISTS
+    global _EXTRA_MAPPING_LISTS, _DERIVED_EXTRA_MAPPING_LISTS
     if not extra_mapping_path or not os.path.isfile(extra_mapping_path):
         return
     try:
         with open(extra_mapping_path) as fh:
-            mappings = json.load(fh)
-        if not isinstance(mappings, list):
-            log.warning("Extra mapping file must contain a JSON array, ignoring")
-            return
+            data = json.load(fh)
     except (json.JSONDecodeError, OSError) as e:
         log.warning(f"Failed to load extra mappings: {e}")
         return
+    if isinstance(data, dict):
+        mappings = data.get("mappings", [])
+        derived_mappings = data.get("derived_mappings", [])
+        if not isinstance(mappings, list) or not isinstance(derived_mappings, list):
+            log.warning(
+                "Extra mapping object must hold lists under 'mappings' / "
+                "'derived_mappings', ignoring")
+            return
+    elif isinstance(data, list):
+        mappings, derived_mappings = data, []
+    else:
+        log.warning(
+            "Extra mapping file must contain a JSON array or an object with "
+            "'mappings'/'derived_mappings', ignoring")
+        return
     _EXTRA_MAPPING_LISTS = [(str(src), str(dst)) for src, dst in mappings]
-    log.info(f"Loaded {len(_EXTRA_MAPPING_LISTS)} extra mappings from {extra_mapping_path}")
+    _DERIVED_EXTRA_MAPPING_LISTS = [
+        (str(src), str(dst)) for src, dst in derived_mappings]
+    log.info(
+        f"Loaded {len(_EXTRA_MAPPING_LISTS)} extra mappings "
+        f"({len(_DERIVED_EXTRA_MAPPING_LISTS)} derived-only) "
+        f"from {extra_mapping_path}")
 
 
 # ── File discovery ────────────────────────────────────────────────────
@@ -552,13 +576,104 @@ def matched_files_iter(
 
 # ── Path rewriting ────────────────────────────────────────────────────
 
-def get_ppu_file_path(rel_filepath: str) -> str:
-    """Compute the PPU-equivalent output path for a CUDA source file.
+# Derived-tree mode: mirror caller-renamed directory components into a
+# derived tree.  See the sailify() docstring for the config format.
 
-    sailify does NOT rename files or directories — the output path is the
-    same as the input path. This function is kept for API compatibility.
+
+def _normalize_derived_tree(derived_tree) -> Optional[dict]:
+    """Validate/normalize the derived_tree config; None when disabled."""
+    if not derived_tree:
+        return None
+    if not isinstance(derived_tree, dict) or "rename" not in derived_tree:
+        raise ValueError(
+            "derived_tree must be a dict like "
+            '{"rename": {"<src-dir>": "<dst-dir>"}, "file_roots": [...], '
+            '"include_roots": [...], "copy": [...]}'
+        )
+    if not derived_tree["rename"]:
+        return None
+    roots = derived_tree.get("file_roots")
+    if roots is not None:
+        if (not isinstance(roots, (list, tuple))
+                or not all(isinstance(r, str) and r for r in roots)):
+            raise ValueError(
+                'derived_tree "file_roots" must be a list of non-empty '
+                f"strings, got {roots!r}"
+            )
+        derived_tree = dict(derived_tree, file_roots=list(roots))
+    copies = derived_tree.get("copy")
+    if copies is not None:
+        if (not isinstance(copies, (list, tuple))
+                or not all(isinstance(c, str) and c for c in copies)):
+            raise ValueError(
+                'derived_tree "copy" must be a list of non-empty glob '
+                f"patterns, got {copies!r}"
+            )
+        derived_tree = dict(derived_tree, copy=list(copies))
+    return derived_tree
+
+
+def _strip_root(path: str, roots) -> bool:
+    if not roots:
+        return True
+    return path.startswith(tuple(r.replace("\\", "/").strip("/") + "/" for r in roots))
+
+
+def _derive_tree_segments(path: str, roots, rename: dict) -> str:
+    """Apply *rename* to directory components of *path* under *roots*."""
+    if not _strip_root(path, roots):
+        return path
+    parts = path.split("/")
+    renamed = [rename.get(p, p) if i < len(parts) - 1 else p
+               for i, p in enumerate(parts)]
+    new_path = "/".join(renamed)
+    return new_path if new_path != path else path
+
+
+def _derive_file_path(rel: str, derived_tree: dict) -> str:
+    """Map *rel* to its derived-tree path."""
+    if not _strip_root(rel, derived_tree.get("file_roots")):
+        return rel
+    # Renaming applies to all dir components of the path, including the
+    # components of the root itself.
+    parts = rel.split("/")
+    renamed = [derived_tree["rename"].get(p, p) for p in parts[:-1]]
+    return "/".join(renamed + [parts[-1]])
+
+
+def get_ppu_file_path(rel_filepath: str, derived_tree: Optional[dict] = None) -> str:
+    """Compute the output path for a source file.
+
+    Unchanged by default; with *derived_tree* it follows the renamed
+    directory components.
     """
-    return rel_filepath
+    if not derived_tree:
+        return rel_filepath
+    rel = rel_filepath.replace(os.sep, "/")
+    return _derive_file_path(rel, derived_tree)
+
+
+def _copy_derived_files(project_directory: str, output_directory: str,
+                        derived_tree: Optional[dict]) -> None:
+    """Mirror derived_tree["copy"] files verbatim into the derived tree."""
+    patterns = (derived_tree or {}).get("copy")
+    if not patterns or not output_directory:
+        return
+    for pattern in patterns:
+        matches = sorted(glob.glob(os.path.join(project_directory, pattern),
+                                   recursive=True))
+        if not matches:
+            raise ValueError(
+                f'derived_tree "copy" pattern matched nothing: {pattern!r}'
+            )
+        for path in matches:
+            if not os.path.isfile(path):
+                continue
+            rel = os.path.relpath(path, project_directory).replace(os.sep, "/")
+            derived_rel = _derive_file_path(rel, derived_tree)
+            dst = os.path.join(output_directory, derived_rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copyfile(path, dst)
 
 
 def _mask_comments_and_strings(source: str) -> str:
@@ -736,7 +851,7 @@ _BARE_ONLY_INCLUDES = {
 }
 
 
-def _rewrite_include_directives(source: str) -> str:
+def _rewrite_include_directives(source: str, derived_tree: Optional[dict] = None) -> str:
     """Apply CUDA_INCLUDE_MAP path replacements specifically in #include directives."""
     from .cuda_to_ppu_mappings import CUDA_INCLUDE_MAP
 
@@ -753,6 +868,11 @@ def _rewrite_include_directives(source: str) -> str:
         suffix = match.group(3)
 
         new_path = path
+
+        if derived_tree:
+            new_path = _derive_tree_segments(
+                new_path, derived_tree.get("include_roots"), derived_tree["rename"]
+            )
 
         if '/' not in new_path and new_path in _BARE_ONLY_INCLUDES:
             new_path = _BARE_ONLY_INCLUDES[new_path]
@@ -799,6 +919,7 @@ def preprocessor(
     inject_compat_include: bool = False,
     inject_compat_include_ignores: Iterable[str] = (),
     compat_include_line: str = COMPAT_WRAPPER_INCLUDE_LINE,
+    derived_tree: Optional[dict] = None,
 ) -> SailifyResult:
     """Process a single CUDA source file and write the PPU equivalent.
 
@@ -812,13 +933,27 @@ def preprocessor(
         rel = os.path.relpath(filepath, project_directory)
     else:
         rel = os.path.relpath(filepath, os.path.dirname(filepath))
-    ppu_rel = get_ppu_file_path(rel)
+    ppu_rel = get_ppu_file_path(rel, derived_tree=derived_tree)
+    _is_derived_write = (
+        bool(derived_tree) and ppu_rel != rel.replace(os.sep, "/"))
     if output_directory:
         out_path = os.path.join(output_directory, ppu_rel)
     else:
         out_path = os.path.join(os.path.dirname(filepath), ppu_rel)
 
     result = SailifyResult(CurrentState.INITIALIZED, os.path.abspath(out_path))
+
+    # In-place derived-tree mode: only renamed mirrors are written; all
+    # other files stay pristine and are reported as "skipped".
+    _derive_in_place = (
+        bool(derived_tree)
+        and _is_derived_write is False
+        and project_directory
+        and os.path.abspath(output_directory or os.path.dirname(filepath))
+        == os.path.abspath(project_directory))
+    if _derive_in_place:
+        result.status = "skipped"
+        return result
 
     try:
         with open(filepath, "r", errors="replace") as fh:
@@ -840,7 +975,7 @@ def preprocessor(
         )
 
     # 1b. Apply include-specific path rewrites BEFORE the trie step
-    output_source = _rewrite_include_directives(output_source)
+    output_source = _rewrite_include_directives(output_source, derived_tree=derived_tree)
 
     # 2. Apply main CUDA→PPU mappings via the pre-compiled trie regex
     _masked = _mask_comments_and_strings(output_source)
@@ -882,6 +1017,11 @@ def preprocessor(
     ):
         output_source = _inject_compat_include(output_source, compat_include_line)
 
+    # Derived-only mappings apply only to files written into the derived tree.
+    if _is_derived_write:
+        for _pat, _repl in _DERIVED_EXTRA_MAPPING_LISTS:
+            output_source = output_source.replace(_pat, _repl)
+
     # Write output
     try:
         out_dir = os.path.dirname(out_path)
@@ -906,7 +1046,7 @@ def preprocessor(
 
     result.current_state = CurrentState.DONE
     result.status = "ok"
-    stats.setdefault("ppuified", []).append(filepath)
+    stats.setdefault("sailified", []).append(filepath)
     return result
 
 
@@ -976,6 +1116,8 @@ def sailify(
     extra_mapping: str = "",
     verbose: bool = False,
     ppu_sdk_version: tuple = None,
+    derived_tree: Optional[dict] = None,
+    skip: Optional[list] = None,
 ) -> dict:
     """Convert CUDA code to PPU code in the given project directory.
 
@@ -990,6 +1132,22 @@ def sailify(
 
     *inject_compat_include_ignores* — glob patterns (relative to
     *project_directory*) of headers exempt from the injection.
+
+    *skip* — project-relative paths of files to leave verbatim (still
+    mirrored to the output tree by the out-of-place copy).  Reported
+    with status "skipped".
+
+    *derived_tree* — write converted files whose directory components
+    match the "rename" map into a mirrored derived tree, keeping the
+    original tree pristine.  In place (output_directory == project root)
+    only the renamed mirrors are written; every other file stays pristine
+    and is reported as "skipped".  Config format:
+
+        {"rename": {"<src-dir>": "<dst-dir>"},
+         "file_roots": [...],     # optional, project-relative roots scoping
+                                  # the mirroring
+         "include_roots": [...],  # optional, include-path roots
+         "copy": [...]}           # optional, glob patterns mirrored verbatim
     """
     if not os.path.isdir(project_directory):
         raise FileNotFoundError(f"Project directory not found: {project_directory}")
@@ -1013,6 +1171,7 @@ def sailify(
         load_extra_mappings(extra_mapping or "")
 
         project_directory = os.path.abspath(project_directory)
+        _out_of_place = False
         if output_directory:
             output_directory = os.path.abspath(output_directory)
             _out_of_place = os.path.abspath(output_directory) != project_directory
@@ -1020,6 +1179,7 @@ def sailify(
                 _copytree_compat(project_directory, output_directory)
         else:
             output_directory = project_directory
+        derived_tree = _normalize_derived_tree(derived_tree)
 
         compat_dir = ppu_compat_dir or os.path.join(output_directory, ".ppu_compat")
         include_line = compat_wrapper_include_line(compat_dir)
@@ -1030,6 +1190,9 @@ def sailify(
 
         _includes = includes or ["*"]
         _ignores = ignores or []
+        _skip_rel = {
+            s.replace("\\", "/").strip("/") for s in skip
+        } if skip else set()
 
         all_files = list(matched_files_iter(
             project_directory, includes=_includes, ignores=_ignores,
@@ -1065,6 +1228,13 @@ def sailify(
         results = {}
 
         for filepath in all_files:
+            if _skip_rel and os.path.relpath(
+                filepath, project_directory
+            ).replace(os.sep, "/") in _skip_rel:
+                res = SailifyResult(sailified_path=os.path.abspath(filepath))
+                res.status = "skipped"
+                results[os.path.abspath(filepath)] = res
+                continue
             res = preprocessor(
                 output_directory=output_directory,
                 filepath=filepath,
@@ -1077,8 +1247,11 @@ def sailify(
                 inject_compat_include=inject_compat_include,
                 inject_compat_include_ignores=inject_compat_include_ignores or [],
                 compat_include_line=include_line,
+                derived_tree=derived_tree,
             )
             results[os.path.abspath(filepath)] = res
+
+        _copy_derived_files(project_directory, output_directory, derived_tree)
 
         if verbose:
             n_ok = sum(1 for r in results.values() if r.status == "ok")

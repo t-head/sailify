@@ -26,8 +26,8 @@ def main(argv):
     failed = 0
     for k, r in items:
         status = getattr(r, "status", "ok")
-        ppu = getattr(r, "ppuified_path", "")
-        print("RESULT %s status=%s out=%s" % (os.path.basename(str(k)), status, ppu))
+        out_path = getattr(r, "sailified_path", "")
+        print("RESULT %s status=%s out=%s" % (os.path.basename(str(k)), status, out_path))
         if status == "ok":
             ok += 1
         else:

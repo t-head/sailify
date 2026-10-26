@@ -127,8 +127,8 @@ def test_sglang_jit_mirror(tmp):
     res = results[kernel_abs]
     if res.status != "ok":
         failures.append("kernel status " + str(res.status))
-    if os.path.abspath(res.ppuified_path) != kernel_abs:
-        failures.append("in-place conversion expected, got " + res.ppuified_path)
+    if os.path.abspath(res.sailified_path) != kernel_abs:
+        failures.append("in-place conversion expected, got " + res.sailified_path)
     if util_abs not in results:
         failures.append("include closure header not discovered")
     with open(kernel) as fh:
@@ -176,8 +176,8 @@ def test_pytorch_cpp_extension_jit(tmp):
     res = results[src_abs]
     if res.status != "ok":
         failures.append("source status " + str(res.status))
-    if os.path.splitext(os.path.abspath(res.ppuified_path))[1] != ".cu":
-        failures.append("extension not preserved: " + res.ppuified_path)
+    if os.path.splitext(os.path.abspath(res.sailified_path))[1] != ".cu":
+        failures.append("extension not preserved: " + res.sailified_path)
     if hdr_abs not in results:
         failures.append("-I include dir header not discovered")
     with open(src) as fh:
@@ -331,8 +331,8 @@ def test_sglang_aot_preprocessor_direct(tmp):
             text = fh.read()
         if "cudaMalloc" in text or "hggcMalloc" not in text:
             failures.append("staged kernel not converted")
-    if stats.get("ppuified") != [src]:
-        failures.append("stats['ppuified'] != [source path]")
+    if stats.get("sailified") != [src]:
+        failures.append("stats['sailified'] != [source path]")
 
     visited = {src}
     discovered = []

@@ -1183,6 +1183,8 @@ def _discover_includes(
             if candidate in visited:
                 break
             if os.path.isfile(candidate):
+                if ".ppu_compat" in candidate.split(os.sep):
+                    break
                 ext = os.path.splitext(candidate)[1]
                 if ext in DEFAULT_EXTENSIONS:
                     visited.add(candidate)

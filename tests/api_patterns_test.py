@@ -193,6 +193,106 @@ def test_pytorch_cpp_extension_jit(tmp):
     return failures
 
 
+_RERUN_KERNEL_CU = """#include "rerun_util.cuh"
+
+__global__ void k(float* out) {
+    rerun_scale(out, 2.0f);
+}
+"""
+
+_RERUN_UTIL_CUH = """#pragma once
+__device__ __forceinline__ void rerun_scale(float* p, float v) {
+    *p = v;
+}
+"""
+
+
+def test_jit_rerun_inject_recursion(tmp):
+    from sailify.sailify_python import sailify_extra_files_recursive
+
+    root = os.path.join(tmp, "jit_rerun")
+    build = os.path.join(root, "build")
+    os.makedirs(build, exist_ok=True)
+    src = os.path.join(build, "kernel.cu")
+    hdr = os.path.join(build, "rerun_util.cuh")
+    with open(src, "w") as fh:
+        fh.write(_RERUN_KERNEL_CU)
+    with open(hdr, "w") as fh:
+        fh.write(_RERUN_UTIL_CUH)
+    compat = os.path.join(build, ".ppu_compat", "compatible_wrapper.h")
+    inject_line = "#include <.ppu_compat/compatible_wrapper.h>"
+
+    failures = []
+    for _ in range(2):
+        results = sailify_extra_files_recursive(
+            output_directory=build,
+            extra_files=[src],
+            header_include_dirs=[],
+            inject_compat_include=True,
+        )
+        if compat in [os.path.abspath(p) for p in results]:
+            failures.append("compatible_wrapper.h entered the BFS queue")
+        if not os.path.isfile(compat):
+            failures.append("compatible_wrapper.h not generated")
+            return failures
+        with open(compat) as fh:
+            first = fh.read().splitlines()[0]
+        if first.strip() == inject_line:
+            failures.append("compatible_wrapper.h re-injected into itself")
+        with open(hdr) as fh:
+            hdr_first = fh.read().splitlines()[0]
+        if hdr_first.strip() != inject_line:
+            failures.append("rerun_util.cuh missing injected wrapper include")
+
+    wheel = os.path.join(root, "wheel_inc")
+    os.makedirs(os.path.join(wheel, ".ppu_compat"), exist_ok=True)
+    wheel_compat = os.path.join(wheel, ".ppu_compat", "compatible_wrapper.h")
+    with open(wheel_compat, "w") as fh:
+        fh.write("#ifndef COMPATIBLE_WRAPPER_H\n#define COMPATIBLE_WRAPPER_H\n#endif\n")
+    with open(os.path.join(wheel, "wheel_util.cuh"), "w") as fh:
+        fh.write(inject_line + "\n#pragma once\n")
+    build2 = os.path.join(root, "build2")
+    os.makedirs(build2, exist_ok=True)
+    src2 = os.path.join(build2, "kernel.cu")
+    with open(src2, "w") as fh:
+        fh.write('#include <wheel_util.cuh>\n__global__ void k2() {}\n')
+
+    results = sailify_extra_files_recursive(
+        output_directory=build2,
+        extra_files=[src2],
+        header_include_dirs=[wheel],
+        inject_compat_include=True,
+    )
+    if wheel_compat in [os.path.abspath(p) for p in results]:
+        failures.append("wheel compatible_wrapper.h entered the BFS queue")
+    with open(wheel_compat) as fh:
+        first = fh.read().splitlines()[0]
+    if first.strip() == inject_line:
+        failures.append("wheel compatible_wrapper.h rewritten via header_include_dirs")
+
+    miss_dir = os.path.join(root, "miss", ".ppu_compat")
+    hit_dir = os.path.join(root, "hit")
+    os.makedirs(miss_dir, exist_ok=True)
+    os.makedirs(hit_dir, exist_ok=True)
+    late_hdr = os.path.join(hit_dir, "late_util.cuh")
+    with open(late_hdr, "w") as fh:
+        fh.write(_RERUN_UTIL_CUH.replace("rerun_scale", "late_scale"))
+    build3 = os.path.join(root, "build3")
+    os.makedirs(build3, exist_ok=True)
+    src3 = os.path.join(build3, "kernel.cu")
+    with open(src3, "w") as fh:
+        fh.write("#include <late_util.cuh>\n__global__ void k3() {}\n")
+    results = sailify_extra_files_recursive(
+        output_directory=build3,
+        extra_files=[src3],
+        header_include_dirs=[miss_dir, hit_dir],
+        inject_compat_include=True,
+    )
+    if os.path.abspath(late_hdr) not in results:
+        failures.append("header in later include dir not discovered past .ppu_compat")
+    return failures
+
+
 def test_sglang_aot_preprocessor_direct(tmp):
     from sailify.sailify_python import (
         _discover_includes,
@@ -450,6 +550,7 @@ def main(argv):
             ("pytorch_write_compat_wrapper_header", lambda: test_write_compat_wrapper_header(tmp)),
             ("sglang_jit_mirror_inplace", lambda: test_sglang_jit_mirror(tmp)),
             ("pytorch_cpp_extension_jit", lambda: test_pytorch_cpp_extension_jit(tmp)),
+            ("jit_rerun_inject_recursion", lambda: test_jit_rerun_inject_recursion(tmp)),
             ("sglang_aot_preprocessor_direct", lambda: test_sglang_aot_preprocessor_direct(tmp)),
             ("sdk22_mapping_state_toggles_with_version", test_sdk22_mapping_state_toggles_with_version),
             ("sdk22_state_resolved_with_compat_disabled", lambda: test_sdk22_state_resolved_with_compat_disabled(tmp)),

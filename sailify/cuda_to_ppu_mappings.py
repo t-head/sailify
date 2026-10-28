@@ -11695,6 +11695,10 @@ PPU_SDK_2_2_IDENTIFIER_MAP = collections.OrderedDict([
     ("__ushort_as_bfloat16", "__hg_ushort_as_bfloat16"),
     ("__bfloat16_as_short", "__hg_bfloat16_as_short"),
     ("__bfloat16_as_ushort", "__hg_bfloat16_as_ushort"),
+    # scalar -> vector broadcast: the RTC legacy decls carry the CUDA
+    # spelling (the acdnn RTC prebuilt needs it); regular TUs only get the
+    # renamed twin, which actlize's cutlass/array.h epilogue reaches.
+    ("__bfloat162bfloat162", "__hg_bfloat162bfloat162"),
     # The pipeline primitives alone keep the __hggc_ spelling in wt_v3's
     # hggc_pipeline_primitives.h.
     ("__pipeline_commit", "__hggc_pipeline_commit"),

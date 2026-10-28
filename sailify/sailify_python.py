@@ -392,15 +392,17 @@ _SDK22_PROBED: Optional[Tuple[Tuple[str, ...], frozenset]] = None
 def _probe_sdk22_identifiers(targets) -> frozenset:
     """Which of `targets` the active PPU SDK actually declares.
 
-    The 2.2-era identifier map rewrites CUDA spellings to __hggc_ ones, but
-    whether an SDK ships the prefixed or the unprefixed spelling is a layout
-    property, not a version property: wt_v3's 2.2 SDK declares the
-    __hggc_ bf16/pipeline intrinsics in regular TUs, while other 2.3-era
-    SDKs declare only the unprefixed CUDA names there.  Rewriting towards a
-    spelling the SDK does not provide would produce undeclared-identifier
-    errors (exactly what the flat-layout SDKs show), so each pair activates
-    only when its target identifier appears in the SDK's headers.  Probe
-    result is cached per include-dirs tuple until the map is reset.
+    The 2.2-era identifier map rewrites CUDA spellings to the SDK-branded
+    ones (__hg_ bf16 conversions, __hggc_pipeline_ primitives), but whether
+    an SDK ships the branded or the unprefixed spelling is a layout
+    property, not a version property: wt_v3's 2.2 SDK declares the __hg_
+    bf16 conversions and __hggc_pipeline_ primitives in regular TUs, while
+    other 2.3-era SDKs declare only the unprefixed CUDA names there.
+    Rewriting towards a spelling the SDK does not provide would produce
+    undeclared-identifier errors (exactly what the flat-layout SDKs show),
+    so each pair activates only when its target identifier appears in the
+    SDK's headers.  Probe result is cached per include-dirs tuple until the
+    map is reset.
     """
     global _SDK22_PROBED
     dirs = tuple(ppu_sdk_include_dirs())
@@ -436,7 +438,7 @@ def _probe_sdk22_identifiers(targets) -> frozenset:
 def _enable_sdk_2_2_mappings() -> None:
     """Activate the PPU SDK >= 2.2 identifier group (idempotent).
 
-    Pairs whose __hggc_/__HG_ target the active SDK does not declare stay
+    Pairs whose branded (__hg_/__hggc_/__HG_) target the active SDK does not declare stay
     off (the CUDA spelling keeps compiling there)."""
     global _SDK22_MAP, _SDK22_RE
     available = _probe_sdk22_identifiers(set(PPU_SDK_2_2_IDENTIFIER_MAP.values()))

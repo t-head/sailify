@@ -308,11 +308,12 @@ def test_sdk22_bf16_pipeline_spelling_rewrite(tmp):
     os.makedirs(src_dir, exist_ok=True)
     src = os.path.join(src_dir, "k.cu")
 
-    # wt_v3-style SDK: the __hggc_ spellings are the declared ones
+    # wt_v3-style SDK: the declared spellings are __hg_ for the bf16
+    # conversions and __hggc_pipeline_ for the pipeline primitives
     wt_inc = os.path.join(tmp, "sdk_wt", "include")
     os.makedirs(wt_inc, exist_ok=True)
     with open(os.path.join(wt_inc, "hggc_bf16.hpp"), "w") as fh:
-        for name in ("__hggc_bfloat162float", "__hggc_float2bfloat16_rn",
+        for name in ("__hg_bfloat162float", "__hg_float2bfloat16_rn",
                      "__hggc_pipeline_commit", "__hggc_pipeline_wait_prior"):
             fh.write("int %s;\n" % name)
     # flat-style SDK: only the unprefixed CUDA spellings exist
@@ -336,7 +337,8 @@ def test_sdk22_bf16_pipeline_spelling_rewrite(tmp):
     failures = []
     orig_dirs = sp.ppu_sdk_include_dirs
     try:
-        # wt_v3 layout: CUDA spellings rewrite to the declared __hggc_ ones
+        # wt_v3 layout: CUDA spellings rewrite to the declared targets
+        # (__hg_ bf16 conversions, __hggc_pipeline_ primitives)
         sp.ppu_sdk_include_dirs = lambda: [wt_inc]
         sp._maybe_enable_sdk_2_2_mappings((2, 2, 0))
         write_case()
@@ -344,10 +346,10 @@ def test_sdk22_bf16_pipeline_spelling_rewrite(tmp):
         with open(src) as fh:
             text = fh.read()
         for cuda_name, ppu_name in (
-            ("__bfloat162float", "__hggc_bfloat162float"),
+            ("__bfloat162float", "__hg_bfloat162float"),
             ("__pipeline_commit", "__hggc_pipeline_commit"),
             ("__pipeline_wait_prior", "__hggc_pipeline_wait_prior"),
-            ("__float2bfloat16_rn", "__hggc_float2bfloat16_rn"),
+            ("__float2bfloat16_rn", "__hg_float2bfloat16_rn"),
         ):
             if ppu_name not in text:
                 failures.append("SDK 2.2 spelling rewrite missing: " + cuda_name)

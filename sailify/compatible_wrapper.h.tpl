@@ -167,8 +167,9 @@
 #define PPU_SDK_FIXUPS_POST
 #include "ppu_sdk_fixups.h"
 
-/* ── GetVersion API stubs ── */
-
+/* ── GetVersion API stubs ──
+ * These stubs back the compatibleXxx spellings emitted by the
+ * cuda-to-hggc identifier conversion. */
 #if defined(__cplusplus)
 
 #ifdef __cplusplus
@@ -194,6 +195,7 @@ static inline hggcError_t compatibleRuntimeGetVersion(int *runtimeVersion) {{
     return (hggcError_t)0;
 }}
 
+/* ac*-typed stubs backed by the pre-included ac headers. */
 static inline acblasStatus_t compatibleBlasGetVersion(acblasHandle_t handle, int *version) {{
     (void)handle;
     if (version) *version = COMPATIBLE_BLAS_VERSION;
@@ -305,6 +307,7 @@ static inline int _compatible_extract_property_cublas(int version, hggcLibraryPr
     return 0;
 }}
 
+/* ac*-typed stubs backed by the pre-included ac headers. */
 static inline acdnnStatus_t compatibleDnnGetProperty(hggcLibraryPropertyType type, int *value) {{
     if (value) *value = _compatible_extract_property_std(COMPATIBLE_DNN_VERSION, type);
     return (acdnnStatus_t)0;

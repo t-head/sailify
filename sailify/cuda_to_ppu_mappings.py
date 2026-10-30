@@ -965,6 +965,17 @@ CUDA_INCLUDE_MAP = collections.OrderedDict([
     ("cusparse_v2.h", "acsparse_v2.h"),
     ("cudaProfiler.h", "hggcProfiler.h"),
     ("cudaTypedefs.h", "hggcTypedefs.h"),
+    # cat1 base headers renamed with hggc_ twins during the SDK tree split;
+    # the bare cuda.h name is mapped by _BARE_ONLY_INCLUDES in sailify_python.py
+    ("driver_types.h", "hggc_driver_types.h"),
+    ("vector_types.h", "hggc_vector_types.h"),
+    ("vector_functions.h", "hggc_vector_functions.h"),
+    ("vector_functions.hpp", "hggc_vector_functions.hpp"),
+    ("host_defines.h", "hggc_host_defines.h"),
+    ("crt/host_defines.h", "hggc_host_defines.h"),
+    ("channel_descriptor.h", "hggc_channel_descriptor.h"),
+    ("surface_types.h", "hggc_surface_types.h"),
+    ("texture_types.h", "hggc_texture_types.h"),
     ("cuda_ad.h", "hggc_ad.h"),
     ("cuda_awbarrier.h", "hggc_awbarrier.h"),
     # NOTE: PPU uses singular "helper" vs CUDA's plural "helpers"
@@ -1007,6 +1018,13 @@ CUDA_INCLUDE_MAP = collections.OrderedDict([
 ])
 
 CUDA_IDENTIFIER_MAP = collections.OrderedDict([
+    # NVIDIA CUB's wrapped-namespace control macros; the PPU SDK's sail copy
+    # renamed them SAIL_CUB_NS_* (its #ifndef guard honors a pre-defined
+    # value), so out-of-line "#define CUB_NS_PREFIX ..." wrappers survive
+    # conversion.
+    ("CUB_NS_PREFIX", "SAIL_CUB_NS_PREFIX"),
+    ("CUB_NS_POSTFIX", "SAIL_CUB_NS_POSTFIX"),
+    ("CUB_NS_QUALIFIER", "SAIL_CUB_NS_QUALIFIER"),
     ("cudaSuccess", "hggcSuccess"),
     ("cudaErrorInvalidValue", "hggcErrorInvalidValue"),
     ("cudaErrorMemoryAllocation", "hggcErrorMemoryAllocation"),
@@ -12294,6 +12312,62 @@ PPU_SDK_2_2_IDENTIFIER_MAP = collections.OrderedDict([
     ("__NV_THREAD_SCOPE_CLUSTER", "__HG_THREAD_SCOPE_CLUSTER"),
     ("__NV_THREAD_SCOPE_DEVICE", "__HG_THREAD_SCOPE_DEVICE"),
     ("__NV_THREAD_SCOPE_SYSTEM", "__HG_THREAD_SCOPE_SYSTEM"),
+    # bf16 conversion intrinsics: wt_v3 PPU_SDK 2.2's hggc_bf16.h brands the
+    # implementations __hg_* (the __hggc_* branding exists only in the older
+    # PPU_SDK_r3-era headers and the .bak_rtcdecl backup), and the CUDA names
+    # are only forwarded under __HGGCCC_RTC__, so a normal hgcc (sail-mode)
+    # compile of converted CUDA source cannot see them. Map the CUDA names
+    # onto the __hg_* implementations.
+    ("__double2bfloat16", "__hg_double2bfloat16"),
+    ("__float22bfloat162_rn", "__hg_float22bfloat162_rn"),
+    ("__float2bfloat16", "__hg_float2bfloat16"),
+    ("__bfloat162float", "__hg_bfloat162float"),
+    ("__bfloat1622float2", "__hg_bfloat1622float2"),
+    ("__float2bfloat162_rn", "__hg_float2bfloat162_rn"),
+    ("__float2bfloat16_rd", "__hg_float2bfloat16_rd"),
+    ("__float2bfloat16_rn", "__hg_float2bfloat16_rn"),
+    ("__float2bfloat16_ru", "__hg_float2bfloat16_ru"),
+    ("__float2bfloat16_rz", "__hg_float2bfloat16_rz"),
+    ("__floats2bfloat162_rn", "__hg_floats2bfloat162_rn"),
+    ("__int2bfloat16_rn", "__hg_int2bfloat16_rn"),
+    ("__int2bfloat16_rz", "__hg_int2bfloat16_rz"),
+    ("__int2bfloat16_rd", "__hg_int2bfloat16_rd"),
+    ("__int2bfloat16_ru", "__hg_int2bfloat16_ru"),
+    ("__internal_bfloat162float", "__hg_internal_bfloat162float"),
+    ("__ll2bfloat16_rn", "__hg_ll2bfloat16_rn"),
+    ("__short2bfloat16_rn", "__hg_short2bfloat16_rn"),
+    ("__short_as_bfloat16", "__hg_short_as_bfloat16"),
+    ("__internal_float2bfloat16", "__hg_internal_float2bfloat16"),
+    ("__uint2bfloat16_rn", "__hg_uint2bfloat16_rn"),
+    ("__uint2bfloat16_rz", "__hg_uint2bfloat16_rz"),
+    ("__uint2bfloat16_rd", "__hg_uint2bfloat16_rd"),
+    ("__uint2bfloat16_ru", "__hg_uint2bfloat16_ru"),
+    ("__ull2bfloat16_rn", "__hg_ull2bfloat16_rn"),
+    ("__ushort2bfloat16_rn", "__hg_ushort2bfloat16_rn"),
+    ("__ushort_as_bfloat16", "__hg_ushort_as_bfloat16"),
+    # bf16 bit-reinterpretation: wt_v3 brands these __hg_bfloat16_as_{short,
+    # ushort} (hggc_bf16.h:183-184); the CUDA spellings do not exist outside
+    # the RTC legacy decls, and torch headeronly BFloat16.h calls
+    # __bfloat16_as_ushort in its __HGGCCC__ constructor path.
+    ("__bfloat16_as_short", "__hg_bfloat16_as_short"),
+    ("__bfloat16_as_ushort", "__hg_bfloat16_as_ushort"),
+    # scalar -> vector broadcast: regular TUs only get the renamed twin
+    # (the CUDA spelling is RTC legacy-only); actlize's cutlass/array.h
+    # epilogue reaches it via this pair.
+    ("__bfloat162bfloat162", "__hg_bfloat162bfloat162"),
+    # occupancy enum constants: hggc_occupancy.h brands them HGGC_*; kineto's
+    # DeviceProperties.cpp (committed for the official SDK naming) uses them bare.
+    ("PARTITIONED_GC_OFF", "HGGC_PARTITIONED_GC_OFF"),
+    ("FUNC_SHMEM_LIMIT_DEFAULT", "HGGC_FUNC_SHMEM_LIMIT_DEFAULT"),
+    # async pipeline primitives: hggc_pipeline_primitives.h brands them
+    # __hggc_pipeline_* with 1:1 signatures (incl. memcpy_async's zfill=0
+    # default).  Converted sources reach them via the include mapping
+    # cuda_pipeline.h -> hggc_pipeline.h, which transitively includes the
+    # primitives header; the wrapper's static forwarder definitions are
+    # gone, so the stock spellings must resolve through these mappings.
+    ("__pipeline_commit", "__hggc_pipeline_commit"),
+    ("__pipeline_wait_prior", "__hggc_pipeline_wait_prior"),
+    ("__pipeline_memcpy_async", "__hggc_pipeline_memcpy_async"),
 ])
 
 CUDA_SPECIAL_MAP = collections.OrderedDict([

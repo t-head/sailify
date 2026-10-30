@@ -32,6 +32,7 @@ from .ppu_sdk_version import (
     detect_ppu_sdk_version,
     detect_runtime_api_version,
     format_version_string,
+    ppu_sdk_include_dirs,
     version_to_int,
 )
 
@@ -226,7 +227,7 @@ def write_compat_wrapper_header(compat_dir, version_config=None,
     header_path = os.path.join(compat_dir, "compatible_wrapper.h")
 
     content = _generate_compat_wrapper_header(
-        version_config, ppu_sdk_version, runtime_api_version
+        version_config, ppu_sdk_version, runtime_api_version,
     )
     with open(header_path, "w") as f:
         f.write(content)
@@ -396,6 +397,219 @@ def _enable_sdk_2_2_mappings() -> None:
         mapping[src] = dst
     _SDK22_MAP = mapping
     _SDK22_RE = re.compile(r"(?<!\w)(" + trie.export_to_regex() + r")(?!\w)")
+    _enable_sail_include_prefixes()
+
+
+# wt_v3-era SDKs nest the cccl headers (and the hggc libcu++ port, once the
+# SDK ships it there) under <SDK>/include/sail/ instead of the include root.
+# The include rewriter prefixes those families with "sail/" so converted
+# sources need no build-system -I workaround.  Families activate only when
+# the SDK actually provides <sail>/<family>; #include <sail/...> paths are
+# left untouched.  The SDK compiles those headers inside `namespace sail`
+# (its SAIL_THRUST_CUB_WRAPPED_NAMESPACE=sail default), so the namespace
+# rewriter below also prefixes the identifiers themselves — converted code
+# speaks sail::thrust / sail::cub / sail::cooperative_groups directly
+# instead of relying on global-namespace aliases in ppu_sdk_fixups.h.
+_SAIL_INCLUDE_FAMILIES: tuple = ()
+_CANDIDATE_SAIL_FAMILIES = ("thrust", "cub", "cooperative_groups", "hggc")
+_SAIL_NS_FAMILIES = ("thrust", "cub", "cooperative_groups")
+_SAIL_NS_COMBINED_RE = None
+# Optional per-family namespace prefix above the sail layer, e.g. mapping
+# {"cub": "at_cuda_detail"} rewrites `cub::x` to
+# `at_cuda_detail::sail::cub::x`.  Set via the extra-mapping JSON's top-level
+# "namespace_prefixes" object (paired with a matching
+# -DSAIL_THRUST_CUB_WRAPPED_NAMESPACE=<prefix> on the compile side); empty
+# means the plain sail:: layer.
+_SAIL_NS_PREFIXES: dict = {}
+
+
+def _enable_sail_include_prefixes() -> None:
+    """Probe the SDK for <sail>/<family> headers and activate prefixes."""
+    global _SAIL_INCLUDE_FAMILIES
+    if _SAIL_INCLUDE_FAMILIES:
+        return
+    families = []
+    for include_dir in ppu_sdk_include_dirs():
+        for fam in _CANDIDATE_SAIL_FAMILIES:
+            if fam in families:
+                continue
+            sail_dir = os.path.join(include_dir, "sail")
+            if os.path.isdir(os.path.join(sail_dir, fam)) or os.path.isfile(
+                os.path.join(sail_dir, fam + ".h")
+            ):
+                families.append(fam)
+    _SAIL_INCLUDE_FAMILIES = tuple(families)
+    if _SAIL_INCLUDE_FAMILIES:
+        log.info(
+            "PPU SDK nests headers under sail/: #include paths of %s get "
+            "a sail/ prefix",
+            ", ".join(_SAIL_INCLUDE_FAMILIES),
+        )
+    _enable_sail_namespace_rewrites()
+
+
+def _enable_sail_namespace_rewrites() -> None:
+    """Namespace-resolve the cccl families the SDK nests under sail/.
+
+    Activated only for families whose headers live under <sail>/ (flat-layout
+    SDKs keep the global namespaces and must not be rewritten).  The rewrite
+    is context-scoped — plain identifiers named thrust/cub stay untouched
+    (actlize uses `cub` as an integer loop variable) — covering only:
+
+      cub::x / foo::cub::x        qualified uses
+      foo::cub                    qualified-last uses
+      namespace cub ...           namespace definitions, forwards, aliases,
+                                  `using namespace cub`
+      namespace cg = cooperative_groups;
+                                  alias declarations of the whole namespace
+                                  (the declared alias name itself is never
+                                  rewritten)
+
+    #include paths, comments and string literals are masked out by the
+    caller's masked sweep.  The rewrite is idempotent (the lookbehinds skip
+    families already prefixed with sail::), so torch's cpp_extension PPU
+    mode can re-run the conversion on already-staged sources.
+
+    Families listed in _SAIL_NS_PREFIXES (from the caller's extra-mapping
+    JSON, "namespace_prefixes") get an additional wrapper namespace between
+    the global scope and sail:: so the SDK's
+    -DSAIL_THRUST_CUB_WRAPPED_NAMESPACE=<prefix> can isolate them for ODR
+    (e.g. `cub::x` → `at_cuda_detail::sail::cub::x` for torch).  Prefix
+    lookups are done per replacement, so the mapping can be (re)loaded after
+    this pass is armed.
+    """
+    global _SAIL_NS_COMBINED_RE
+    if _SAIL_NS_COMBINED_RE is not None:
+        return
+    fams = [f for f in _SAIL_NS_FAMILIES if f in _SAIL_INCLUDE_FAMILIES]
+    if not fams:
+        return
+    fam = "|".join(re.escape(f) for f in fams)
+    _SAIL_NS_COMBINED_RE = re.compile(
+        r"(?<!sail::)(?<!\w)(?P<q1>%(fam)s)::"
+        r"|(?<!sail)::(?P<q2>%(fam)s)(?!\w)"
+        r"|namespace\s+(?P<chain>(?:\w+\s*::\s*)*)(?P<decl>%(fam)s)\b(?!\s*=)"
+        r"|namespace\s+(?P<alias>\w+)\s*=\s*(?P<rhs>%(fam)s)\s*;"
+        % {"fam": fam}
+    )
+    log.info(
+        "Converted sources reference %s directly (source-level "
+        "namespace resolution)",
+        ", ".join("sail::" + fam for fam in fams),
+    )
+
+
+def _ends_with_token(src: str, end: int, token: str) -> bool:
+    """True when src[:end] ends with exactly *token* and no identifier char
+    glues it to a longer name (so checking for `at_cuda_detail` never
+    matches `xat_cuda_detail`)."""
+    start = end - len(token)
+    if start < 0 or not src.startswith(token, start):
+        return False
+    if start == 0:
+        return True
+    ch = src[start - 1]
+    return not (ch.isalnum() or ch == "_")
+
+
+def _ns_prefix(fam: str) -> str:
+    return _SAIL_NS_PREFIXES.get(fam, "")
+
+
+def _sail_ns_repl(match) -> str:
+    src = match.string
+    if match.group("q1") is not None:
+        fam = match.group("q1")
+        pre = _ns_prefix(fam)
+        # If the text right before already spells `<prefix>::` (torch's
+        # `at_cuda_detail::cub::x`), only the sail layer is missing;
+        # otherwise the prefix layer goes in front of it.  With no prefix
+        # configured this reduces to the plain sail:: insertion.
+        if _ends_with_token(src, match.start(), pre + "::"):
+            head = ""
+        else:
+            head = pre + "::" if pre else ""
+        return head + "sail::" + fam + "::"
+    if match.group("q2") is not None:
+        fam = match.group("q2")
+        pre = _ns_prefix(fam)
+        before = src[: match.start()].rstrip()
+        # `::fam` shows up in shapes that must NOT gain the prefix layer,
+        # because the prefix already arrives from their context:
+        #  - a chain member (`at::cuda::cub`, torch's own wrapper namespace)
+        #  - a closed macro argument in front (`NO_ROCM(at_cuda_detail)::cub`)
+        #  - a whole macro argument (`ROCM_HIPCUB(::cub)`, expands right
+        #    behind NO_ROCM(at_cuda_detail))
+        # Only a global qualification (`::cub::x` with nothing glued before)
+        # gets `at_cuda_detail::` in front of the sail layer.
+        chain_member = bool(re.search(r"\w+\s*$", before))
+        closed_macro_arg = bool(
+            pre and re.search(r"%s\s*\)\s*$" % re.escape(pre), before)
+        )
+        whole_macro_arg = (
+            before.endswith("(")
+            and src[match.end():].lstrip().startswith(")")
+        )
+        if chain_member or closed_macro_arg or whole_macro_arg:
+            head = ""
+        else:
+            head = pre + "::" if pre else ""
+        return "::" + head + "sail::" + fam
+    if match.group("decl") is not None:
+        fam = match.group("decl")
+        chain = match.group("chain") or ""
+        pre = _ns_prefix(fam)
+        if chain.endswith("sail::") or (pre and chain == pre + "::sail::"):
+            return match.group(0)
+        if chain:
+            # C++17 nested namespace chain (torch: `namespace at::cuda::cub
+            # {`): the chain member belongs to the enclosing namespace
+            # structure, so only the sail layer goes in — matching what the
+            # qualified uses of the same spelling get.
+            return "namespace %ssail::%s" % (chain, fam)
+        # torch opens the wrapper as `namespace at_cuda_detail { namespace
+        # cub {`; when the enclosing block is the prefix itself, only the
+        # sail layer must be inserted or the prefix would double up.
+        if pre and re.search(
+            r"namespace\s+%s\s*\{\s*$" % re.escape(pre), src[: match.start()]
+        ):
+            return "namespace sail::" + fam
+        head = pre + "::" if pre else ""
+        return "namespace " + head + "sail::" + fam
+    fam = match.group("rhs")
+    pre = _ns_prefix(fam)
+    head = pre + "::" if pre else ""
+    return "namespace %s = %ssail::%s;" % (
+        match.group("alias"), head, fam)
+
+
+def _sub_masked(pattern, repl, source: str, mask: str) -> str:
+    """re.sub, but only where the pre-computed mask is not 'x'."""
+    parts: List[str] = []
+    last = 0
+    for m in pattern.finditer(source):
+        if mask[m.start()] == 'x':
+            continue
+        parts.append(source[last:m.start()])
+        parts.append(repl(m))
+        last = m.end()
+    if not parts:
+        return source
+    parts.append(source[last:])
+    return "".join(parts)
+
+
+def _replace_masked_literal(source: str, pattern: str, replacement: str) -> str:
+    """str.replace that skips comment and string literal spans.
+
+    Extra-mapping patterns are plain substrings, so a raw replace could
+    rewrite prose inside comments or error-message strings; masking keeps
+    those at their stock spelling, like every other conversion pass.
+    """
+    mask = _mask_comments_and_strings(source, mask_strings=True)
+    return _sub_masked(
+        re.compile(re.escape(pattern)), lambda _m: replacement, source, mask
+    )
 
 
 def _maybe_enable_sdk_2_2_mappings(ppu_sdk_version) -> None:
@@ -435,22 +649,30 @@ def update_custom_mappings(custom_map_list: str) -> None:
 
 
 # ── Extra mapping lists (from --extra-mapping config) ────────────────
-# A list of (pattern, replacement) string pairs applied AFTER the main
-# trie replacement step.  Loaded from a JSON file via --extra-mapping,
-# either as a flat JSON array of [from, to] pairs (applied to every
-# converted file) or as an object:
-#
-#     {"mappings": [[from, to], ...],          # every converted file
-#      "derived_mappings": [[from, to], ...]}  # only derived-tree files
+# Applied AFTER the generic conversion passes, in list order, via masked
+# literal replace (comment and string literal spans keep their stock
+# spelling).  This is the extension point for project-specific residue
+# spellings the generic passes deliberately leave alone.  Loaded from a JSON
+# file via --extra-mapping; the file is either a bare array of
+# [pattern, replacement] pairs or an object of the shape
+#   {"mappings": [[from, to], ...],          # every converted file
+#    "derived_mappings": [[from, to], ...],  # only derived-tree files
+#    "namespace_prefixes": {"cub": "at_cuda_detail", ...}}
+# where namespace_prefixes feeds _SAIL_NS_PREFIXES (the compile side must
+# define the matching -DSAIL_THRUST_CUB_WRAPPED_NAMESPACE).
 _EXTRA_MAPPING_LISTS = []
 _DERIVED_EXTRA_MAPPING_LISTS = []
 
 
 def load_extra_mappings(extra_mapping_path: str) -> None:
-    """Load extra string-to-string mappings from a JSON file.
-    Each pair is applied via ``str.replace`` on the post-trie source text.
+    """Load extra mappings (and namespace prefixes) from a JSON file.
+
+    Each mapping pair is applied in list order via a masked literal replace
+    on the post-conversion source text.  Order matters: earlier rules
+    rewrite the text later rules match against.  Loading a file replaces the
+    previously loaded configuration, so this is a complete per-call setup.
     """
-    global _EXTRA_MAPPING_LISTS, _DERIVED_EXTRA_MAPPING_LISTS
+    global _EXTRA_MAPPING_LISTS, _DERIVED_EXTRA_MAPPING_LISTS, _SAIL_NS_PREFIXES
     if not extra_mapping_path or not os.path.isfile(extra_mapping_path):
         return
     try:
@@ -467,20 +689,26 @@ def load_extra_mappings(extra_mapping_path: str) -> None:
                 "Extra mapping object must hold lists under 'mappings' / "
                 "'derived_mappings', ignoring")
             return
+        raw_prefixes = data.get("namespace_prefixes") or {}
+        if not isinstance(raw_prefixes, dict):
+            log.warning("namespace_prefixes must be a JSON object, ignoring")
+            raw_prefixes = {}
     elif isinstance(data, list):
-        mappings, derived_mappings = data, []
+        mappings, derived_mappings, raw_prefixes = data, [], {}
     else:
         log.warning(
             "Extra mapping file must contain a JSON array or an object with "
-            "'mappings'/'derived_mappings', ignoring")
+            "'mappings'/'derived_mappings'/'namespace_prefixes', ignoring")
         return
     _EXTRA_MAPPING_LISTS = [(str(src), str(dst)) for src, dst in mappings]
     _DERIVED_EXTRA_MAPPING_LISTS = [
         (str(src), str(dst)) for src, dst in derived_mappings]
+    _SAIL_NS_PREFIXES = {str(k): str(v) for k, v in raw_prefixes.items()}
     log.info(
         f"Loaded {len(_EXTRA_MAPPING_LISTS)} extra mappings "
-        f"({len(_DERIVED_EXTRA_MAPPING_LISTS)} derived-only) "
-        f"from {extra_mapping_path}")
+        f"({len(_DERIVED_EXTRA_MAPPING_LISTS)} derived-only)"
+        + (f" and namespace prefixes {_SAIL_NS_PREFIXES}" if _SAIL_NS_PREFIXES else "")
+        + f" from {extra_mapping_path}")
 
 
 # ── File discovery ────────────────────────────────────────────────────
@@ -676,8 +904,18 @@ def _copy_derived_files(project_directory: str, output_directory: str,
             shutil.copyfile(path, dst)
 
 
-def _mask_comments_and_strings(source: str) -> str:
-    """Mask comments and char literals with 'x' to gate identifier replacement."""
+_INC_PATH_SPAN_RE = re.compile(r'([<"])([^>"]*)([>"])')
+
+
+def _mask_comments_and_strings(source: str, mask_strings: bool = False) -> str:
+    """Mask comments, char literals and #include paths with 'x' to gate
+    identifier replacement.
+
+    String-literal contents stay unmasked by default (the CUDA identifier
+    passes have always rewritten them); *mask_strings* additionally masks
+    string contents — the namespace rewriter uses it so prose like error
+    messages keeps the stock spellings.
+    """
     n = len(source)
     in_include = [False] * n
     line_start = 0
@@ -690,14 +928,11 @@ def _mask_comments_and_strings(source: str) -> str:
             stripped_start += 1
         if source[stripped_start:stripped_start + 8] == '#include':
             rest = source[stripped_start + 8:line_end]
-            q1 = rest.find('"')
-            if q1 != -1:
-                q2 = rest.find('"', q1 + 1)
-                if q2 != -1:
-                    abs_q1 = stripped_start + 8 + q1
-                    abs_q2 = stripped_start + 8 + q2
-                    for j in range(abs_q1, abs_q2 + 1):
-                        in_include[j] = True
+            m = _INC_PATH_SPAN_RE.search(rest)
+            if m:
+                base = stripped_start + 8
+                for j in range(base + m.start(), base + m.end()):
+                    in_include[j] = True
         line_start = line_end + 1
 
     def _count_trailing_backslashes(pos: int) -> int:
@@ -715,7 +950,7 @@ def _mask_comments_and_strings(source: str) -> str:
         c = source[i]
 
         if in_include[i]:
-            result.append(c)
+            result.append('x')
             i += 1
             continue
 
@@ -798,15 +1033,15 @@ def _mask_comments_and_strings(source: str) -> str:
 
         elif in_context == '"':
             if c == '\\':
-                result.append(c)
+                result.append('x' if mask_strings else c)
                 i += 1
                 if i < n:
-                    result.append(source[i])
+                    result.append('x' if mask_strings else source[i])
                     i += 1
                 continue
             if c == '"':
                 in_context = ''
-            result.append(c)
+            result.append('x' if mask_strings else c)
             i += 1
 
         elif in_context == "'":
@@ -892,6 +1127,12 @@ def _rewrite_include_directives(source: str, derived_tree: Optional[dict] = None
                         new_path = new_path[:last_slash + 1] + ppu_path
                     else:
                         new_path = ppu_path
+
+        for fam in _SAIL_INCLUDE_FAMILIES:
+            if (new_path == fam or new_path.startswith(fam + "/")
+                    or new_path.startswith(fam + ".")):
+                new_path = "sail/" + new_path
+                break
         return prefix + new_path + suffix
 
     return _inc_re.sub(_replace, source)
@@ -1006,8 +1247,25 @@ def preprocessor(
         _new_parts.append(output_source[_last_end:])
         output_source = "".join(_new_parts)
 
+    # 2c. Namespace-resolve the cccl families the SDK nests under sail/
+    # (sail::thrust, sail::cub, ...); inactive on flat-layout SDKs.  The
+    # combined regex only fires in namespace contexts (fam::, ::fam,
+    # namespace fam, namespace x = fam;), so ordinary identifiers named
+    # `cub`/`thrust` (actlize loop variables) pass through untouched.
+    # Strings are masked here so error-message prose keeps stock spellings.
+    if _SAIL_NS_COMBINED_RE is not None:
+        _masked_ns = _mask_comments_and_strings(output_source, mask_strings=True)
+        output_source = _sub_masked(
+            _SAIL_NS_COMBINED_RE, _sail_ns_repl, output_source, _masked_ns
+        )
+
+    # Extra-mapping residue rules (project-specific spellings the generic
+    # passes deliberately leave alone) run last, in list order, masked like
+    # the passes above.
     for _pat, _repl in _EXTRA_MAPPING_LISTS:
-        output_source = output_source.replace(_pat, _repl)
+        if not _pat:
+            continue
+        output_source = _replace_masked_literal(output_source, _pat, _repl)
 
     if (
         inject_compat_include
@@ -1020,7 +1278,9 @@ def preprocessor(
     # Derived-only mappings apply only to files written into the derived tree.
     if _is_derived_write:
         for _pat, _repl in _DERIVED_EXTRA_MAPPING_LISTS:
-            output_source = output_source.replace(_pat, _repl)
+            if not _pat:
+                continue
+            output_source = _replace_masked_literal(output_source, _pat, _repl)
 
     # Write output
     try:

@@ -105,7 +105,7 @@ else
   let FAIL=FAIL+1
 fi
 
-for c in hello_kernel vector_add shared_reduce ext_lambda events_api header_user; do
+for c in hello_kernel vector_add shared_reduce ext_lambda events_api header_user cat1_headers; do
   find "${OUT}/extra" -name "${c}.cu" > "${OUT}/${c}.found"
   if [ -s "${OUT}/${c}.found" ]; then
     echo "PASS extra output ${c}.cu"
@@ -114,6 +114,17 @@ for c in hello_kernel vector_add shared_reduce ext_lambda events_api header_user
     let FAIL=FAIL+1
   fi
 done
+
+CAT1_CU=$(find "${OUT}/extra" -name "cat1_headers.cu" | head -1)
+if [ -n "${CAT1_CU}" ] \
+   && grep -q "hggc_driver_types.h" "${CAT1_CU}" \
+   && grep -q "\"hggc_host_defines.h\"" "${CAT1_CU}" \
+   && ! grep -Eq '#include[[:space:]]+[<"](driver_types|vector_types|vector_functions|host_defines|channel_descriptor|surface_types|texture_types|crt/host_defines)\.(h|hpp)[>"]' "${CAT1_CU}"; then
+  echo "PASS cat1 base header rewrite"
+else
+  echo "FAIL cat1 base header rewrite (see ${CAT1_CU:-missing})"
+  let FAIL=FAIL+1
+fi
 
 if [ "${SKIP_COMPILE}" = "1" ]; then
   echo "SUMMARY pass=skip fail=$((FAIL+0))"
@@ -140,7 +151,7 @@ else
   echo "WARN extra: no .ppu_compat, compiling without compatible_wrapper.h"
 fi
 
-for c in hello_kernel vector_add shared_reduce ext_lambda events_api header_user; do
+for c in hello_kernel vector_add shared_reduce ext_lambda events_api header_user cat1_headers; do
   find "${OUT}/extra" -name "${c}.cu" > "${OUT}/${c}.found"
   cuf=""
   read -r cuf < "${OUT}/${c}.found" || true

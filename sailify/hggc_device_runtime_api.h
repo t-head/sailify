@@ -5,10 +5,36 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+/* The CUDA-named runtime headers are spelled differently across SDK
+ * distributions: the official SDK keeps the unbranded names (host_defines.h,
+ * driver_types.h, vector_types.h) in its include root, while the mix-sdk
+ * distribution brands them (hggc_driver_types.h, ...) and only ships
+ * host_defines under hgrt/.  Probe for each spelling so the compat layer
+ * works against either tree.  hgrt/host_defines.h is preferred over
+ * hggc_host_defines.h because it defines __HGGCRT_HOST_DEFINES_H__, which
+ * thrust's guarded_hggc_runtime_api.h checks before #undef-ing __host__ /
+ * __device__. */
+#if __has_include(<hgrt/host_defines.h>)
+#include <hgrt/host_defines.h>
+#elif __has_include(<hggc_host_defines.h>)
+#include "hggc_host_defines.h"
+#elif __has_include(<host_defines.h>)
 #include "host_defines.h"
+#endif
+
+#if __has_include(<hggc_driver_types.h>)
+#include "hggc_driver_types.h"
+#elif __has_include(<driver_types.h>)
 #include "driver_types.h"
+#endif
+
 #include "hggc.h"
+
+#if __has_include(<hggc_vector_types.h>)
+#include "hggc_vector_types.h"
+#elif __has_include(<vector_types.h>)
 #include "vector_types.h"
+#endif
 
 static __inline__ __device__ hggcGraphExec_t hggcGetCurrentGraphExec(void)
 {

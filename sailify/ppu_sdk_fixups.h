@@ -302,7 +302,8 @@ typedef enum {
 #endif
 
 /* C++ compatibility wrappers: provide overloads that accept hggcDataType
- * for computeType, migrating to acblasComputeType_t before calling the real API. */
+ * for computeType, migrating to acblasComputeType_t before calling the real
+ * API. */
 #if defined(__cplusplus)
 
 /* Convert hggcDataType to acblasComputeType_t. */
@@ -438,6 +439,8 @@ static inline acblasStatus_t acblasGemmStridedBatchedEx(acblasHandle_t handle,
                         migratedComputeType,
                         algo);
 }
+#endif /* __cplusplus */
+
 /* Missing CUPTI CBID enum values, defined as _SIZE sentinels (no-op).
  * PPU SDK >= 2.2 defines them natively. */
 #if PPU_SDK_VERSION < 20200
@@ -450,7 +453,6 @@ static inline acblasStatus_t acblasGemmStridedBatchedEx(acblasHandle_t handle,
 #endif
 #endif /* PPU_SDK_VERSION < 20200 */
 
-#endif /* __cplusplus */
 #endif /* !__HGGCCC_RTC__ */
 
 /* PPU SDK's hggc/functional port lacks hggc::maximum / hggc::minimum

@@ -23380,7 +23380,10 @@
         }
       ],
       "library": "cupti",
-      "is_extern_c": false
+      "is_extern_c": false,
+      "version": {
+        "end": 20299
+      }
     },
     {
       "name": "acrandGenerateBinomial",

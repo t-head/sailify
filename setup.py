@@ -1,11 +1,18 @@
 from setuptools import setup, find_packages
+import os
+
+
+long_description = ''
+if os.path.exists('README.md'):
+    with open('README.md', encoding='utf-8') as readme:
+        long_description = readme.read()
 
 
 setup(
     name='sailify',
     version='1.0.1',
     description='Generic CUDA to PPU source code conversion tool',
-    long_description=open('README.md').read() if __import__('os').path.exists('README.md') else '',
+    long_description=long_description,
     long_description_content_type='text/markdown',
     author='sailify contributors',
     python_requires='>=3.8',

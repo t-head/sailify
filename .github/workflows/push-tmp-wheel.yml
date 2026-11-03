@@ -1,0 +1,85 @@
+name: Push Temporary Wheel
+
+# Publishes sailify wheels to the timestamped temporary wheel repository.
+# Manual runs and pushes to the validation branch publish to the real temporary
+# repository; run only on trusted branches.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Optional branch/tag/SHA to build; empty = the branch you trigger from'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and save wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      artifact_name: tmp-wheel-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out caller code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Python for the build
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build tools
+        shell: bash
+        run: python -m pip install --no-input wheel setuptools
+
+      # sailify is a pure-Python wheel; the build is driven by setup.py only,
+      # and every generated .whl is uploaded unchanged.
+      - name: Build wheel
+        shell: bash
+        run: python setup.py bdist_wheel --dist-dir "$RUNNER_TEMP/push-tmp-wheel-dist"
+
+      - name: Save wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tmp-wheel-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/push-tmp-wheel-dist/*.whl
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Call temporary wheel upload template
+    needs: build
+    # For production, pin both @main and template_ref to the same full commit SHA in the template repository.
+    uses: t-head/ci-infra/.github/workflows/push-tmp-wheel.yml@main
+    with:
+      # Use the actual artifact name from the build job output so rerunning only the publish job does not select a different run_attempt.
+      artifact_name: ${{ needs.build.outputs.artifact_name }}
+      template_repository: t-head/ci-infra
+      template_ref: main
+    secrets:
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+      # Enable as needed for private template repositories, and allow cross-repository calls in the template repository Actions settings.
+      # template_token: ${{ secrets.TEMPLATE_TOKEN }}
+
+  result:
+    name: Show batch directory URL
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write to logs and job summary
+        shell: bash
+        env:
+          UPLOAD_URL: ${{ needs.publish.outputs.upload_url }}
+        run: |
+          set -euo pipefail
+          printf 'Batch directory: %s\n' "$UPLOAD_URL" | tee -a "$GITHUB_STEP_SUMMARY"

@@ -219,7 +219,8 @@ _COMPAT_STATIC_HEADERS = ["hgperf_common.h", "hgperf_host.h", "ppu_sdk_fixups.h"
 
 
 def write_compat_wrapper_header(compat_dir, version_config=None,
-                                ppu_sdk_version=None, runtime_api_version=None):
+                                ppu_sdk_version=None, runtime_api_version=None,
+                                stub_probe=True):
     """Write compatible_wrapper.h and static compat headers to compat_dir/."""
     os.makedirs(compat_dir, exist_ok=True)
     header_path = os.path.join(compat_dir, "compatible_wrapper.h")
@@ -234,7 +235,7 @@ def write_compat_wrapper_header(compat_dir, version_config=None,
     else:
         log.info("Generated default compatible_wrapper.h in %s", compat_dir)
 
-    write_stubs_header(compat_dir)
+    write_stubs_header(compat_dir, stub_probe=stub_probe)
 
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     for hdr in _COMPAT_STATIC_HEADERS:
@@ -976,12 +977,17 @@ def sailify(
     extra_mapping: str = "",
     verbose: bool = False,
     ppu_sdk_version: tuple = None,
+    stub_probe: bool = True,
 ) -> dict:
     """Convert CUDA code to PPU code in the given project directory.
 
     *ppu_sdk_version* — explicit (major, minor[, patch]) PPU SDK tuple for
     the version-conditional fixups.  When None it is auto-detected from the
     environment (see ppu_sdk_version.detect_ppu_sdk_version).
+
+    *stub_probe* — when True (default), stub only APIs the installed SDK
+    does not export (see unsupported_stubs.probe); when False, emit every
+    unsupported_apis.json entry with its version gate.
 
     *inject_compat_include* — prepend the compat wrapper include to every
     converted header (.h/.hpp/.cuh).  The path segment follows the name of
@@ -1054,6 +1060,7 @@ def sailify(
                 version_config if version_config else None,
                 ppu_sdk_version=ppu_sdk_version,
                 runtime_api_version=runtime_api_version,
+                stub_probe=stub_probe,
             )
         elif inject_compat_include:
             log.warning(
@@ -1091,7 +1098,7 @@ def sailify(
     return results
 
 
-def _ensure_ppu_compat(output_directory: str) -> None:
+def _ensure_ppu_compat(output_directory: str, stub_probe: bool = True) -> None:
     """(Re)generate .ppu_compat in output_directory with the detected PPU SDK version."""
     compat_dir = os.path.join(output_directory, ".ppu_compat")
     ppu_sdk_version = detect_ppu_sdk_version()
@@ -1099,7 +1106,8 @@ def _ensure_ppu_compat(output_directory: str) -> None:
     runtime_api_version = detect_runtime_api_version()
     _print_detected_versions(ppu_sdk_version, runtime_api_version)
     write_compat_wrapper_header(compat_dir, ppu_sdk_version=ppu_sdk_version,
-                                runtime_api_version=runtime_api_version)
+                                runtime_api_version=runtime_api_version,
+                                stub_probe=stub_probe)
 
 
 def sailify_extra_files(
@@ -1109,6 +1117,7 @@ def sailify_extra_files(
     install_ppu_compat: bool = True,
     inject_compat_include: bool = False,
     inject_compat_include_ignores: list = None,
+    stub_probe: bool = True,
 ) -> dict:
     """Sailify only the specified extra_files.
 
@@ -1118,7 +1127,7 @@ def sailify_extra_files(
     output_directory = os.path.abspath(output_directory)
     _maybe_enable_sdk_2_2_mappings(detect_ppu_sdk_version())
     if install_ppu_compat:
-        _ensure_ppu_compat(output_directory)
+        _ensure_ppu_compat(output_directory, stub_probe=stub_probe)
     stats: Dict[str, list] = {}
     results = {}
 
@@ -1201,6 +1210,7 @@ def sailify_extra_files_recursive(
     install_ppu_compat: bool = True,
     inject_compat_include: bool = False,
     inject_compat_include_ignores: list = None,
+    stub_probe: bool = True,
 ) -> dict:
     """Sailify extra_files with recursive #include dependency discovery.
 
@@ -1227,7 +1237,7 @@ def sailify_extra_files_recursive(
     output_directory = os.path.abspath(output_directory)
     _maybe_enable_sdk_2_2_mappings(detect_ppu_sdk_version())
     if install_ppu_compat:
-        _ensure_ppu_compat(output_directory)
+        _ensure_ppu_compat(output_directory, stub_probe=stub_probe)
     _header_include_dirs = header_include_dirs or []
     stats: Dict[str, list] = {}
     results = {}

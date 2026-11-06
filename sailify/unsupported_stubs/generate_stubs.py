@@ -1,26 +1,25 @@
-"""Auto-generate C/C++ stub implementations for unsupported CUDA APIs.
+"""Generate ``ppu_unsupported_stubs.h``: ``static inline`` stubs that print an
+error and ``exit(1)`` for APIs the PPU SDK does not implement.
 
-This module reads ``unsupported_apis.json`` and generates a C
-header file (``ppu_unsupported_stubs.h``) containing ``static inline`` stub
-functions.  Each stub prints an error message and calls ``exit(1)``.
+``unsupported_apis.json`` is the superset of possibly-unsupported APIs.
+With ``stub_probe=True`` (default) the installed SDK's exported symbols are
+probed (see ``probe.py``) and a stub is emitted only for APIs no host library
+provides.  Libraries that cannot be probed keep their stubs with their
+``version`` begin/end gate, and so does everything when ``stub_probe=False``.
 
-The JSON config already contains PPU-mapped function names and types —
-this module simply formats them into C code.  An API may carry an optional
-``version`` range (``{"begin": .., "end": ..}`` in ``PPU_SDK_VERSION`` units,
-major*10000+minor*100+patch) restricting the stub to those SDK versions;
-without it the stub is defined for every version.
-
-Usage from sailify_python.py::
-
-    from .unsupported_stubs import write_stubs_header
-    write_stubs_header(compat_dir)
+When ``SAILIFY_STUB_PROBE_REPORT`` is set, the APIs found already supported
+(stubs dropped) are printed to stdout.
 """
 
 import json
 import os
 import logging
 
+from .probe import probe_supported_apis
+
 log = logging.getLogger(__name__)
+
+_REPORT_ENV = "SAILIFY_STUB_PROBE_REPORT"
 
 
 def _format_param(decl_template: str, name: str) -> str:
@@ -95,11 +94,22 @@ def _generate_stub_function(api: dict) -> str:
     return f"static inline {decl} {{\n" + "\n".join(body_lines) + "\n}"
 
 
-def generate_stubs_header() -> str:
+def _print_supported_report(apis, probe):
+    if not os.environ.get(_REPORT_ENV):
+        return
+    supported = sorted(a["name"] for a in apis if a["name"] in probe.supported)
+    print(f"sailify stub probe: {len(supported)}/{len(apis)} APIs already "
+          f"supported by this SDK (stubs dropped):")
+    for name in supported:
+        print(f"  {name}")
+
+
+def generate_stubs_header(stub_probe=True):
     """Generate the full content of ``ppu_unsupported_stubs.h``.
 
-    Returns:
-        The header file content as a string, ready to be written to disk.
+    ``stub_probe`` True (default) probes the installed SDK and stubs only
+    APIs it does not export; libraries that cannot be probed keep their
+    version-gated stubs.  False emits every JSON entry with its version gate.
     """
     json_path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
@@ -109,7 +119,10 @@ def generate_stubs_header() -> str:
         data = json.load(f)
 
     apis = data["apis"]
-    unmapped_types = data.get("unmapped_types", [])
+
+    probe = probe_supported_apis(apis) if stub_probe else None
+    if probe is not None:
+        _print_supported_report(apis, probe)
 
     # Group by library for readability
     apis_by_lib: dict = {}
@@ -127,8 +140,13 @@ def generate_stubs_header() -> str:
         lines.append(f"/* ── {lib_name}: {len(lib_apis)} unsupported APIs ── */")
         lines.append("")
 
+        probed = probe is not None and lib_name in probe.probed
         for api in lib_apis:
-            gate = _version_gate(api)
+            if probed and api["name"] in probe.supported:
+                continue
+            # The probe is specific to the concrete SDK; unprobed libraries
+            # fall back to the compile-time version gate.
+            gate = "" if probed else _version_gate(api)
             if gate:
                 lines.append(gate)
             lines.append(_generate_stub_function(api))
@@ -141,20 +159,13 @@ def generate_stubs_header() -> str:
     return "\n".join(lines)
 
 
-def write_stubs_header(output_dir: str) -> str:
-    """Write ``ppu_unsupported_stubs.h`` to *output_dir*.
-
-    Args:
-        output_dir: Directory to write the header file to (e.g. ``.ppu_compat/``).
-
-    Returns:
-        The absolute path to the written header file.
-    """
+def write_stubs_header(output_dir: str, stub_probe: bool = True) -> str:
+    """Write ``ppu_unsupported_stubs.h`` to *output_dir*."""
     os.makedirs(output_dir, exist_ok=True)
     header_path = os.path.join(output_dir, "ppu_unsupported_stubs.h")
-    content = generate_stubs_header()
+    content = generate_stubs_header(stub_probe=stub_probe)
     with open(header_path, "w") as f:
         f.write(content)
-    stub_count = content.count("static inline")
-    log.info("Generated ppu_unsupported_stubs.h (%d stubs) in %s", stub_count, output_dir)
+    log.info("Generated ppu_unsupported_stubs.h (%d stubs) in %s",
+             content.count("static inline"), output_dir)
     return header_path

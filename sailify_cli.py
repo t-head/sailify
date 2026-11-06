@@ -129,6 +129,12 @@ def main():
         help="PPU SDK version for conditional fixups (e.g. 2.2, 2v2 or "
              "2.1.1). Auto-detected from `hgcc --version` when omitted.",
     )
+    parser.add_argument(
+        "--stub-probe", choices=("on", "off"), default=None,
+        help="Probe the installed SDK and stub only APIs it does not "
+             "export (default). 'off' emits every unsupported_apis.json "
+             "entry with its version gate.",
+    )
 
     args = parser.parse_args()
 
@@ -150,6 +156,7 @@ def main():
     inject_compat_include_ignores = args.inject_compat_include_ignores
     version_config = {}
     ppu_sdk_version_raw = None
+    stub_probe = None
 
     if args.config_json:
         if not os.path.isfile(args.config_json):
@@ -184,6 +191,17 @@ def main():
             version_config.update(cfg["version_config"])
         if cfg.get("ppu_sdk_version"):
             ppu_sdk_version_raw = str(cfg["ppu_sdk_version"])
+        if "stub_probe" in cfg and cfg["stub_probe"] is not None:
+            value = cfg["stub_probe"]
+            if isinstance(value, str):
+                if value.lower() not in ("on", "off"):
+                    parser.error(
+                        f"Invalid stub_probe in config JSON: {value!r} "
+                        "(expected 'on' or 'off')"
+                    )
+                stub_probe = value.lower() == "on"
+            else:
+                stub_probe = bool(value)
 
     # Build version config from CLI args (overrides JSON)
     if args.cuda_version:
@@ -223,6 +241,12 @@ def main():
         except ValueError as e:
             parser.error(str(e))
 
+    # CLI --stub-probe wins over the config JSON; default is on.
+    if args.stub_probe is not None:
+        stub_probe = args.stub_probe == "on"
+    if stub_probe is None:
+        stub_probe = True
+
     if not project_directory:
         parser.error("project_directory or --config-json is required.")
 
@@ -250,6 +274,7 @@ def main():
         inject_compat_include_ignores=inject_compat_include_ignores,
         verbose=args.verbose,
         ppu_sdk_version=ppu_sdk_version,
+        stub_probe=stub_probe,
     )
 
     # Summary

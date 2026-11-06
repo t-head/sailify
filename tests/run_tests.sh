@@ -205,6 +205,23 @@ APF=${APFW#fail=}
 let BPASS=BPASS+APP
 let BFAIL=BFAIL+APF
 let FAIL=FAIL+APRC
+
+echo "== phase 7: unsupported-API stub probe =="
+PRC=0
+"$PYTHON" "${SCRIPT_DIR}/probe_test.py" > "${OUT}/logs/probe.log" 2>&1 || PRC=1
+cat "${OUT}/logs/probe.log"
+PRP=0
+PRF=0
+grep "^PROBE_SUMMARY" "${OUT}/logs/probe.log" > "${OUT}/prs.txt" 2>/dev/null || true
+read -r _ PRPW PRFW < "${OUT}/prs.txt" || true
+PRP=${PRPW#pass=}
+PRF=${PRFW#fail=}
+# The test may die before printing its summary line.
+PRP=${PRP:-0}
+PRF=${PRF:-0}
+let BPASS=BPASS+PRP
+let BFAIL=BFAIL+PRF
+let FAIL=FAIL+PRC
 echo ""
 echo "Artifacts and logs kept under: ${OUT}"
 

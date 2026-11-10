@@ -389,6 +389,55 @@ def test_sdk22_mapping_state_toggles_with_version():
     return failures
 
 
+_SDK23_RENAME_CASES = [
+    ("#include <channel_descriptor.h>", "#include <hggc_channel_descriptor.h>"),
+    ("#include <driver_functions.h>", "#include <hggc_driver_functions.h>"),
+    ("#include <driver_types.h>", "#include <hggc_driver_types.h>"),
+    ("#include <host_defines.h>", "#include <hggc_host_defines.h>"),
+    ("#include <vector_functions.h>", "#include <hggc_vector_functions.h>"),
+    ("#include <vector_functions.hpp>", "#include <hggc_vector_functions.hpp>"),
+    ("#include <vector_types.h>", "#include <hggc_vector_types.h>"),
+    ('#include "texture_types.h.h"', '#include "hggc_texture_types.h"'),
+    ('#include "texture_types.h"', '#include "hggc_texture_types.hpp"'),
+    ('#include "sub/vector_types.h"', '#include "sub/hggc_vector_types.h"'),
+    ("#include <cuda_runtime.h>", "#include <hggc_runtime.h>"),
+    ("#include<vector_types.h>", "#include<hggc_vector_types.h>"),
+    ('#include"host_defines.h"', '#include"hggc_host_defines.h"'),
+    ("# include <vector_types.h>", "# include <hggc_vector_types.h>"),
+]
+
+
+def test_sdk23_renames_toggles_with_version():
+    import sailify.sailify_python as sp
+
+    failures = []
+    try:
+        sp._maybe_enable_sdk_version_mappings((2, 3, 0))
+        if not sp._SDK23_RENAME_ACTIVE:
+            failures.append("SDK 2.3 renames not enabled for version (2, 3, 0)")
+        for src, expected in _SDK23_RENAME_CASES:
+            got = sp._rewrite_include_directives(src)
+            if got != expected:
+                failures.append("SDK 2.3 rename %r -> %r, expected %r" % (src, got, expected))
+
+        for version in ((2, 2, 9), (2, 2, 0), (2, 1, 5), None):
+            sp._maybe_enable_sdk_version_mappings(version)
+            if sp._SDK23_RENAME_ACTIVE:
+                failures.append("SDK 2.3 renames not disabled for version %r" % (version,))
+            for src, expected in _SDK23_RENAME_CASES[:9]:
+                got = sp._rewrite_include_directives(src)
+                if "hggc_" in got:
+                    failures.append("legacy include rewritten for version %r: %r -> %r" % (version, src, got))
+                    break
+
+        sp._maybe_enable_sdk_version_mappings((2, 3, 1))
+        if not sp._SDK23_RENAME_ACTIVE:
+            failures.append("SDK 2.3 renames not enabled for version (2, 3, 1)")
+    finally:
+        sp._maybe_enable_sdk_version_mappings(None)
+    return failures
+
+
 def test_sdk22_state_resolved_with_compat_disabled(tmp):
     import sailify.sailify_python as sp
 
@@ -553,6 +602,7 @@ def main(argv):
             ("jit_rerun_inject_recursion", lambda: test_jit_rerun_inject_recursion(tmp)),
             ("sglang_aot_preprocessor_direct", lambda: test_sglang_aot_preprocessor_direct(tmp)),
             ("sdk22_mapping_state_toggles_with_version", test_sdk22_mapping_state_toggles_with_version),
+            ("sdk23_renames_toggles_with_version", test_sdk23_renames_toggles_with_version),
             ("sdk22_state_resolved_with_compat_disabled", lambda: test_sdk22_state_resolved_with_compat_disabled(tmp)),
             ("versioned_runtime_api_conversion", lambda: test_versioned_runtime_api_conversion(tmp)),
             ("nvcc_flag_mapping", test_nvcc_flag_mapping),

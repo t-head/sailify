@@ -5,10 +5,36 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+/* Header renames introduced in PPU_SDK 2v3.  PPU_SDK_VERSION (from
+ * compatible_wrapper.h or -D) wins; without it, fall back to __has_include
+ * so the header still picks the right spelling when no version macro is
+ * available at compile time. */
+#if defined(PPU_SDK_VERSION) && PPU_SDK_VERSION > 0
+#if PPU_SDK_VERSION >= 20300
+#define _HGGC_DEV_RT_SDK_2V3 1
+#else
+#define _HGGC_DEV_RT_SDK_2V3 0
+#endif
+#elif __has_include(<hggc_host_defines.h>)
+#define _HGGC_DEV_RT_SDK_2V3 1
+#else
+#define _HGGC_DEV_RT_SDK_2V3 0
+#endif
+
+#if _HGGC_DEV_RT_SDK_2V3
+#include "hggc_host_defines.h"
+#include "hggc_driver_types.h"
+#else
 #include "host_defines.h"
 #include "driver_types.h"
+#endif
 #include "hggc.h"
+#if _HGGC_DEV_RT_SDK_2V3
+#include "hggc_vector_types.h"
+#else
 #include "vector_types.h"
+#endif
+#undef _HGGC_DEV_RT_SDK_2V3
 
 static __inline__ __device__ hggcGraphExec_t hggcGetCurrentGraphExec(void)
 {

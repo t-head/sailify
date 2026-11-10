@@ -25,6 +25,7 @@ from typing import Iterable, Iterator, Optional, Dict, List
 from .cuda_to_ppu_mappings import (
     CUDA_TO_PPU_MAPPINGS,
     PPU_SDK_2_2_IDENTIFIER_MAP,
+    PPU_SDK_2_3_RENAME_MAP,
 )
 from .unsupported_stubs import write_stubs_header
 from .ppu_sdk_version import (
@@ -406,6 +407,26 @@ def _maybe_enable_sdk_2_2_mappings(ppu_sdk_version) -> None:
         _SDK22_RE = None
 
 
+# ── SDK-version-conditional renames (PPU_SDK 2v3) ─────────────────────
+
+_SDK_2_3_VERSION_INT = 20300  # version_to_int((2, 3, 0))
+
+_SDK23_RENAME_ACTIVE = False
+
+
+def _maybe_enable_sdk_2_3_mappings(ppu_sdk_version) -> None:
+    global _SDK23_RENAME_ACTIVE
+    _SDK23_RENAME_ACTIVE = (
+        ppu_sdk_version is not None
+        and version_to_int(ppu_sdk_version) >= _SDK_2_3_VERSION_INT
+    )
+
+
+def _maybe_enable_sdk_version_mappings(ppu_sdk_version) -> None:
+    _maybe_enable_sdk_2_2_mappings(ppu_sdk_version)
+    _maybe_enable_sdk_2_3_mappings(ppu_sdk_version)
+
+
 # ── Custom mapping support ────────────────────────────────────────────
 
 _CUSTOM_TRIE = Trie()
@@ -741,11 +762,15 @@ def _rewrite_include_directives(source: str) -> str:
     from .cuda_to_ppu_mappings import CUDA_INCLUDE_MAP
 
     _inc_re = re.compile(
-        r'^([ \t]*#[ \t]*include[ \t]+[<"])([^>"]+)([>"])',
+        r'^([ \t]*#[ \t]*include[ \t]*[<"])([^>"]+)([>"])',
         re.MULTILINE,
     )
 
-    _sorted_pairs = sorted(CUDA_INCLUDE_MAP.items(), key=lambda kv: -len(kv[0]))
+    if _SDK23_RENAME_ACTIVE:
+        pairs = list(CUDA_INCLUDE_MAP.items()) + list(PPU_SDK_2_3_RENAME_MAP.items())
+    else:
+        pairs = CUDA_INCLUDE_MAP.items()
+    _sorted_pairs = sorted(pairs, key=lambda kv: -len(kv[0]))
 
     def _replace(match):
         prefix = match.group(1)
@@ -1045,7 +1070,7 @@ def sailify(
 
         if ppu_sdk_version is None:
             ppu_sdk_version = detect_ppu_sdk_version()
-        _maybe_enable_sdk_2_2_mappings(ppu_sdk_version)
+        _maybe_enable_sdk_version_mappings(ppu_sdk_version)
         if install_ppu_compat:
             runtime_api_version = detect_runtime_api_version()
             _print_detected_versions(ppu_sdk_version, runtime_api_version)
@@ -1095,7 +1120,7 @@ def _ensure_ppu_compat(output_directory: str) -> None:
     """(Re)generate .ppu_compat in output_directory with the detected PPU SDK version."""
     compat_dir = os.path.join(output_directory, ".ppu_compat")
     ppu_sdk_version = detect_ppu_sdk_version()
-    _maybe_enable_sdk_2_2_mappings(ppu_sdk_version)
+    _maybe_enable_sdk_version_mappings(ppu_sdk_version)
     runtime_api_version = detect_runtime_api_version()
     _print_detected_versions(ppu_sdk_version, runtime_api_version)
     write_compat_wrapper_header(compat_dir, ppu_sdk_version=ppu_sdk_version,
@@ -1116,7 +1141,7 @@ def sailify_extra_files(
     a dict mapping absolute input path -> SailifyResult.
     """
     output_directory = os.path.abspath(output_directory)
-    _maybe_enable_sdk_2_2_mappings(detect_ppu_sdk_version())
+    _maybe_enable_sdk_version_mappings(detect_ppu_sdk_version())
     if install_ppu_compat:
         _ensure_ppu_compat(output_directory)
     stats: Dict[str, list] = {}
@@ -1225,7 +1250,7 @@ def sailify_extra_files_recursive(
         Dict mapping absolute input path -> SailifyResult.
     """
     output_directory = os.path.abspath(output_directory)
-    _maybe_enable_sdk_2_2_mappings(detect_ppu_sdk_version())
+    _maybe_enable_sdk_version_mappings(detect_ppu_sdk_version())
     if install_ppu_compat:
         _ensure_ppu_compat(output_directory)
     _header_include_dirs = header_include_dirs or []

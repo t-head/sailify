@@ -1006,6 +1006,19 @@ CUDA_INCLUDE_MAP = collections.OrderedDict([
     ("CUptiUtil_MergePcSampDataParams", "HGptiUtil_MergePcSampDataParams"),
 ])
 
+# Renames introduced in PPU_SDK 2v3.
+PPU_SDK_2_3_RENAME_MAP = collections.OrderedDict([
+    ("channel_descriptor.h", "hggc_channel_descriptor.h"),
+    ("driver_functions.h", "hggc_driver_functions.h"),
+    ("driver_types.h", "hggc_driver_types.h"),
+    ("host_defines.h", "hggc_host_defines.h"),
+    ("vector_functions.h", "hggc_vector_functions.h"),
+    ("vector_functions.hpp", "hggc_vector_functions.hpp"),
+    ("vector_types.h", "hggc_vector_types.h"),
+    ("texture_types.h.h", "hggc_texture_types.h"),
+    ("texture_types.h", "hggc_texture_types.hpp"),
+])
+
 CUDA_IDENTIFIER_MAP = collections.OrderedDict([
     ("cudaSuccess", "hggcSuccess"),
     ("cudaErrorInvalidValue", "hggcErrorInvalidValue"),

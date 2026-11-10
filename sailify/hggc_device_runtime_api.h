@@ -22,15 +22,15 @@
 #endif
 
 #if _HGGC_DEV_RT_SDK_2V3
-#include "hggc_host_defines.h"
-#include "hggc_driver_types.h"
+#include <hggc_host_defines.h>
+#include <hggc_driver_types.h>
 #else
 #include "host_defines.h"
 #include "driver_types.h"
 #endif
 #include "hggc.h"
 #if _HGGC_DEV_RT_SDK_2V3
-#include "hggc_vector_types.h"
+#include <hggc_vector_types.h>
 #else
 #include "vector_types.h"
 #endif

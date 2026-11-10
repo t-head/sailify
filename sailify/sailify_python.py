@@ -218,6 +218,31 @@ def _generate_compat_wrapper_header(version_config=None, ppu_sdk_version=None,
 # Static compat headers that ship alongside compatible_wrapper.h
 _COMPAT_STATIC_HEADERS = ["hgperf_common.h", "hgperf_host.h", "ppu_sdk_fixups.h", "mma.h", "hggc_fp4.h", "hggc_device_runtime_api.h"]
 
+_SDK23_SHIM_HEADERS = [
+    ("hggc_channel_descriptor.h", "channel_descriptor.h"),
+    ("hggc_driver_functions.h", "driver_functions.h"),
+    ("hggc_driver_types.h", "driver_types.h"),
+    ("hggc_host_defines.h", "host_defines.h"),
+    ("hggc_vector_functions.h", "vector_functions.h"),
+    ("hggc_vector_functions.hpp", "vector_functions.hpp"),
+    ("hggc_vector_types.h", "vector_types.h"),
+    ("hggc_texture_types.h", "texture_types.h"),
+    ("hggc_texture_types.hpp", "hggc_texture_types.h"),
+]
+
+
+def _generate_sdk_2_3_shim(name, fallback):
+    """Shim header for the PPU_SDK 2v3 renames: pass through to the SDK
+    header with the same name when it exists, otherwise forward to
+    *fallback* (the pre-rename spelling)."""
+    return (
+        f"#if __has_include_next(<{name}>)\n"
+        f"#include_next <{name}>\n"
+        "#else\n"
+        f"#include <{fallback}>\n"
+        "#endif\n"
+    )
+
 
 def write_compat_wrapper_header(compat_dir, version_config=None,
                                 ppu_sdk_version=None, runtime_api_version=None):
@@ -244,6 +269,11 @@ def write_compat_wrapper_header(compat_dir, version_config=None,
             dst = os.path.join(compat_dir, hdr)
             shutil.copy2(src, dst)
             log.info("Copied %s to %s", hdr, compat_dir)
+
+    if ppu_sdk_version is not None and version_to_int(ppu_sdk_version) >= _SDK_2_3_VERSION_INT:
+        for name, fallback in _SDK23_SHIM_HEADERS:
+            with open(os.path.join(compat_dir, name), "w") as f:
+                f.write(_generate_sdk_2_3_shim(name, fallback))
 
 
 # ── File extensions ────────────────────────────────────────────────────

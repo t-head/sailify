@@ -438,6 +438,35 @@ def test_sdk23_renames_toggles_with_version():
     return failures
 
 
+def test_sdk23_compat_shims(tmp):
+    import sailify.sailify_python as sp
+
+    failures = []
+    compat = os.path.join(tmp, "shims", ".ppu_compat")
+    sp.write_compat_wrapper_header(compat, ppu_sdk_version=(2, 3, 0))
+    for name, fallback in sp._SDK23_SHIM_HEADERS:
+        path = os.path.join(compat, name)
+        if not os.path.isfile(path):
+            failures.append("missing .ppu_compat shim " + name)
+            continue
+        with open(path) as f:
+            content = f.read()
+        if f"#include_next <{name}>" not in content:
+            failures.append("shim %s has no include_next pass-through" % name)
+        if f"#include <{fallback}>" not in content:
+            failures.append("shim %s does not forward to %s" % (name, fallback))
+        if "#ifndef" in content or "#define PPU" in content:
+            failures.append("shim %s contains a guard" % name)
+
+    for idx, version in enumerate(((2, 2, 0), (2, 1, 5), None)):
+        compat = os.path.join(tmp, "shims", str(idx))
+        sp.write_compat_wrapper_header(compat, ppu_sdk_version=version)
+        for name, _ in sp._SDK23_SHIM_HEADERS:
+            if os.path.isfile(os.path.join(compat, name)):
+                failures.append("shim %s generated for SDK version %r" % (name, version))
+    return failures
+
+
 def test_sdk22_state_resolved_with_compat_disabled(tmp):
     import sailify.sailify_python as sp
 
@@ -603,6 +632,7 @@ def main(argv):
             ("sglang_aot_preprocessor_direct", lambda: test_sglang_aot_preprocessor_direct(tmp)),
             ("sdk22_mapping_state_toggles_with_version", test_sdk22_mapping_state_toggles_with_version),
             ("sdk23_renames_toggles_with_version", test_sdk23_renames_toggles_with_version),
+            ("sdk23_compat_shims", lambda: test_sdk23_compat_shims(tmp)),
             ("sdk22_state_resolved_with_compat_disabled", lambda: test_sdk22_state_resolved_with_compat_disabled(tmp)),
             ("versioned_runtime_api_conversion", lambda: test_versioned_runtime_api_conversion(tmp)),
             ("nvcc_flag_mapping", test_nvcc_flag_mapping),

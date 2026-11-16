@@ -58,6 +58,58 @@ def test_pytorch_codegen_string_conversion():
     return failures
 
 
+def test_device_function_mapping():
+    from sailify.sailify_python import _PPU_MAP, _PPU_TRIE
+
+    rx = re.compile(rf"(?<!\w)({_PPU_TRIE.export_to_regex()})(?!\w)")
+
+    def sailify_str(s):
+        return rx.sub(lambda m: _PPU_MAP[m.group(1)], s)
+
+    cases = [
+        # plain C name forwarding (hggc_device_functions.h / hggc_cmath.h)
+        ("float e = __nv_erff(x);", ["erff(x)"]),
+        ("double e = __nv_erf(x);", ["= erf("]),
+        ("float c = __nv_erfcf(x);", ["erfcf(x)"]),
+        ("float r = __nv_sqrtf(x);", ["sqrtf(x)"]),
+        ("float m = __nv_fmaf(a, b, c);", ["fmaf(a, b, c)"]),
+        ("float h = __nv_hypotf(a, b);", ["hypotf(a, b)"]),
+        ("float j = __nv_fast_sincosf(x, &s, &c);", ["__sincosf(x, &s, &c)"]),
+        # double-underscore builtin forwarding
+        ("unsigned int b = __nv_brev(v);", ["__brev(v)"]),
+        ("int n = __nv_clz(v);", ["__clz(v)"]),
+        ("float f = __nv_fmul_rn(a, b);", ["__fmul_rn(a, b)"]),
+        ("float i = __nv_int_as_float(x);", ["__int_as_float(x)"]),
+        # fast-math spellings map onto the __<fn>f builtins
+        ("float t = __nv_fast_cosf(x);", ["__cosf(x)"]),
+        # double variants
+        ("double d = __nv_sincos(x, &s, &c);", ["sincos(x, &s, &c)"]),
+        ("double q = __nv_pow(x, y);", ["pow(x, y)"]),
+    ]
+    failures = []
+    for src, expected in cases:
+        got = sailify_str(src)
+        for e in expected:
+            if e not in got:
+                failures.append(src + " missing " + e + ": got " + got)
+        if "__nv_" in got:
+            failures.append(src + " still contains an __nv_ spelling: " + got)
+        if sailify_str(got) != got:
+            failures.append(src + " not idempotent")
+    untouched = [
+        # no PPU counterpart exists: spelling must be preserved
+        "float h = __nv_half2float(x);",
+        "float p = __nv_powif(x, n);",
+        "int s = __nv_signbitd(d);",
+        # word-boundary: an identifier embedding __nv_erff must not be rewritten
+        "int my__nv_erff_var = 0;",
+    ]
+    for src in untouched:
+        if sailify_str(src) != src:
+            failures.append(src + " should stay untouched, got " + sailify_str(src))
+    return failures
+
+
 def test_write_compat_wrapper_header(tmp):
     from sailify.sailify_python import write_compat_wrapper_header
 
@@ -625,6 +677,7 @@ def main(argv):
     try:
         for name, fn in [
             ("pytorch_codegen_string_conversion", test_pytorch_codegen_string_conversion),
+            ("device_function_mapping", test_device_function_mapping),
             ("pytorch_write_compat_wrapper_header", lambda: test_write_compat_wrapper_header(tmp)),
             ("sglang_jit_mirror_inplace", lambda: test_sglang_jit_mirror(tmp)),
             ("pytorch_cpp_extension_jit", lambda: test_pytorch_cpp_extension_jit(tmp)),

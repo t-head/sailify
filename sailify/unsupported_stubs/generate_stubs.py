@@ -1,5 +1,6 @@
 """Generate ``ppu_unsupported_stubs.h``: ``static inline`` stubs that print an
-error and ``exit(1)`` for APIs the PPU SDK does not implement.
+error and return the corresponding not-supported status when their return type
+defines one. Other return types retain ``exit(1)`` for unsupported APIs.
 
 ``unsupported_apis.json`` is the superset of possibly-unsupported APIs.
 With ``stub_probe=True`` (default) the installed SDK's exported symbols are
@@ -20,7 +21,6 @@ from .probe import probe_supported_apis
 log = logging.getLogger(__name__)
 
 _REPORT_ENV = "SAILIFY_STUB_PROBE_REPORT"
-
 
 def _format_param(decl_template: str, name: str) -> str:
     """Format a parameter declaration from a type_str template.
@@ -55,10 +55,11 @@ def _version_gate(api: dict) -> str:
     return "#if " + " || ".join(conds)
 
 
-def _generate_stub_function(api: dict) -> str:
+def _generate_stub_function(api: dict, not_supported_status: dict) -> str:
     """Generate a single ``static inline`` stub function for *api*.
 
     *api* is a dict with PPU-mapped keys: name, return_type, parameters, library.
+    *not_supported_status* maps return types to status values from the JSON config.
     """
     func_name = api["name"]
     return_type = api["return_type"].strip()
@@ -86,10 +87,13 @@ def _generate_stub_function(api: dict) -> str:
         body_lines.append(f"    {void_casts};")
 
     body_lines.append(f'    fprintf(stderr, "{func_name} is not supported.\\n");')
-    body_lines.append(f"    exit(1);")
-
-    if return_type and return_type != "void":
-        body_lines.append(f"    return ({return_type})0;  /* unreachable */")
+    not_supported = not_supported_status.get(return_type)
+    if not_supported is not None:
+        body_lines.append(f"    return {not_supported};")
+    else:
+        body_lines.append("    exit(1);")
+        if return_type and return_type != "void":
+            body_lines.append(f"    return ({return_type})0;  /* unreachable */")
 
     return f"static inline {decl} {{\n" + "\n".join(body_lines) + "\n}"
 
@@ -119,6 +123,7 @@ def generate_stubs_header(stub_probe=True):
         data = json.load(f)
 
     apis = data["apis"]
+    not_supported_status = data.get("not_supported_status", {})
 
     probe = probe_supported_apis(apis) if stub_probe else None
     if probe is not None:
@@ -149,7 +154,7 @@ def generate_stubs_header(stub_probe=True):
             gate = "" if probed else _version_gate(api)
             if gate:
                 lines.append(gate)
-            lines.append(_generate_stub_function(api))
+            lines.append(_generate_stub_function(api, not_supported_status))
             if gate:
                 lines.append("#endif")
             lines.append("")

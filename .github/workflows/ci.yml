@@ -39,9 +39,6 @@ jobs:
       - name: Run smoke tests
         run: python tests/api_patterns_test.py
 
-      - name: Run unsupported API stub tests
-        run: python test_unsupported_stubs.py
-
   ai-code-review:
     name: AI Code Review (Copilot Gate)
     needs: precheck

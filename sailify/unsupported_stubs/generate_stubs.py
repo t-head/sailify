@@ -22,20 +22,6 @@ log = logging.getLogger(__name__)
 
 _REPORT_ENV = "SAILIFY_STUB_PROBE_REPORT"
 
-# Select by return type to avoid status codes for void, pointers, or plain integers.
-_NOT_SUPPORTED_STATUS = {
-    "acblasStatus_t": "ACBLAS_STATUS_NOT_SUPPORTED",
-    "acdnnStatus_t": "ACDNN_STATUS_NOT_SUPPORTED",
-    "acfftResult": "ACFFT_NOT_SUPPORTED",
-    "acsolverStatus_t": "ACSOLVER_STATUS_NOT_SUPPORTED",
-    "acsparseStatus_t": "ACSPARSE_STATUS_NOT_SUPPORTED",
-    "HGresult": "HGGC_ERROR_NOT_SUPPORTED",
-    "hggcError_t": "hggcErrorNotSupported",
-    "hgmlReturn_t": "HGML_ERROR_NOT_SUPPORTED",
-    "HGptiResult": "HGPTI_ERROR_NOT_SUPPORTED",
-}
-
-
 def _format_param(decl_template: str, name: str) -> str:
     """Format a parameter declaration from a type_str template.
 
@@ -69,10 +55,11 @@ def _version_gate(api: dict) -> str:
     return "#if " + " || ".join(conds)
 
 
-def _generate_stub_function(api: dict) -> str:
+def _generate_stub_function(api: dict, not_supported_status: dict) -> str:
     """Generate a single ``static inline`` stub function for *api*.
 
     *api* is a dict with PPU-mapped keys: name, return_type, parameters, library.
+    *not_supported_status* maps return types to status values from the JSON config.
     """
     func_name = api["name"]
     return_type = api["return_type"].strip()
@@ -100,7 +87,7 @@ def _generate_stub_function(api: dict) -> str:
         body_lines.append(f"    {void_casts};")
 
     body_lines.append(f'    fprintf(stderr, "{func_name} is not supported.\\n");')
-    not_supported = _NOT_SUPPORTED_STATUS.get(return_type)
+    not_supported = not_supported_status.get(return_type)
     if not_supported is not None:
         body_lines.append(f"    return {not_supported};")
     else:
@@ -136,6 +123,7 @@ def generate_stubs_header(stub_probe=True):
         data = json.load(f)
 
     apis = data["apis"]
+    not_supported_status = data.get("not_supported_status", {})
 
     probe = probe_supported_apis(apis) if stub_probe else None
     if probe is not None:
@@ -166,7 +154,7 @@ def generate_stubs_header(stub_probe=True):
             gate = "" if probed else _version_gate(api)
             if gate:
                 lines.append(gate)
-            lines.append(_generate_stub_function(api))
+            lines.append(_generate_stub_function(api, not_supported_status))
             if gate:
                 lines.append("#endif")
             lines.append("")

@@ -2,7 +2,9 @@
 
 This module reads ``unsupported_apis.json`` and generates a C
 header file (``ppu_unsupported_stubs.h``) containing ``static inline`` stub
-functions.  Each stub prints an error message and calls ``exit(1)``.
+functions.  Each stub prints an error message and returns the corresponding
+not-supported status when its return type defines one.  Other return types
+retain the ``exit(1)`` behavior.
 
 The JSON config already contains PPU-mapped function names and types —
 this module simply formats them into C code.
@@ -18,6 +20,19 @@ import os
 import logging
 
 log = logging.getLogger(__name__)
+
+# Select by return type to avoid status codes for void, pointers, or plain integers.
+_NOT_SUPPORTED_STATUS = {
+    "acblasStatus_t": "ACBLAS_STATUS_NOT_SUPPORTED",
+    "acdnnStatus_t": "ACDNN_STATUS_NOT_SUPPORTED",
+    "acfftResult": "ACFFT_NOT_SUPPORTED",
+    "acsolverStatus_t": "ACSOLVER_STATUS_NOT_SUPPORTED",
+    "acsparseStatus_t": "ACSPARSE_STATUS_NOT_SUPPORTED",
+    "HGresult": "HGGC_ERROR_NOT_SUPPORTED",
+    "hggcError_t": "hggcErrorNotSupported",
+    "hgmlReturn_t": "HGML_ERROR_NOT_SUPPORTED",
+    "HGptiResult": "HGPTI_ERROR_NOT_SUPPORTED",
+}
 
 
 def _format_param(decl_template: str, name: str) -> str:
@@ -63,10 +78,13 @@ def _generate_stub_function(api: dict) -> str:
         body_lines.append(f"    {void_casts};")
 
     body_lines.append(f'    fprintf(stderr, "{func_name} is not supported.\\n");')
-    body_lines.append(f"    exit(1);")
-
-    if return_type and return_type != "void":
-        body_lines.append(f"    return ({return_type})0;  /* unreachable */")
+    not_supported = _NOT_SUPPORTED_STATUS.get(return_type)
+    if not_supported is not None:
+        body_lines.append(f"    return {not_supported};")
+    else:
+        body_lines.append("    exit(1);")
+        if return_type and return_type != "void":
+            body_lines.append(f"    return ({return_type})0;  /* unreachable */")
 
     return f"static inline {decl} {{\n" + "\n".join(body_lines) + "\n}"
 

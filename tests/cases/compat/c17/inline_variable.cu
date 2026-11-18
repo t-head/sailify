@@ -1,0 +1,1 @@
+inline __device__ int xxx = 10;

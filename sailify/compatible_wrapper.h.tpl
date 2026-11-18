@@ -14,39 +14,26 @@
  *   Video: {video_str}, CUPTI: {cupti_ver}, NPP: {npp_major}.{npp_minor}.{npp_build}
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <hggc.h>
+/* ── SDK-independent part ── */
 
-/* PPU SDK fixups — must come before other PPU SDK headers */
-#include "ppu_sdk_fixups.h"
-
-/* PPU SDK headers — C++ only (pure C third-party code may conflict) */
-#if defined(__cplusplus)
-
-#include <hgpti_result.h>
-#include <hgrtc.h>
-#include <hgJitLink.h>
-#include <hgTIXCompiler.h>
-#include <acblas_v2.h>
-#include <acfft.h>
-#include <acrand.h>
-#include <acsparse.h>
-#include <acsolver_common.h>
-#include <acsolverDn.h>
-#include <acdnn.h>
-#include <hgml.h>
-#include <hgpti_checkpoint.h>
-#include <hgpti_pcsampling_util.h>
-#include <hggc_library_types.h>
-#include <hgppdefs.h>
-#include <hgppcore.h>
-
-#endif /* __cplusplus */
-
-/* PPU SDK fixups (post-include phase) */
-#define PPU_SDK_FIXUPS_POST
-#include "ppu_sdk_fixups.h"
+/* ── PPU SDK version ──
+ * Resolved by sailify ({ppu_sdk_str} here); 0 = unknown keeps the legacy
+ * behavior.  Override at compile time with
+ * -DPPU_SDK_VERSION=<major>*10000+<minor>*100+<patch>. */
+#ifndef PPU_SDK_VERSION_MAJOR
+#define PPU_SDK_VERSION_MAJOR {ppu_sdk_major}
+#endif
+#ifndef PPU_SDK_VERSION_MINOR
+#define PPU_SDK_VERSION_MINOR {ppu_sdk_minor}
+#endif
+#ifndef PPU_SDK_VERSION_PATCH
+#define PPU_SDK_VERSION_PATCH {ppu_sdk_patch}
+#endif
+#ifndef PPU_SDK_VERSION
+#define PPU_SDK_VERSION ((PPU_SDK_VERSION_MAJOR) * 10000 \
+                         + (PPU_SDK_VERSION_MINOR) * 100 \
+                         + (PPU_SDK_VERSION_PATCH))
+#endif
 
 /* ── Version macros ── */
 
@@ -128,6 +115,58 @@
   #endif
 #endif
 
+/* ── SDK-dependent part ── */
+#if defined(__has_include)
+#  if __has_include(<hggc.h>)
+#    define COMPAT_WRAPPER_HAS_PPU_SDK
+#  endif
+#else
+/* No __has_include support: assume the PPU toolchain. */
+#  define COMPAT_WRAPPER_HAS_PPU_SDK
+#endif
+
+#if defined(__HGGCCC_RTC__) && defined(COMPAT_WRAPPER_HAS_PPU_SDK)
+
+/* Device-only RTC: macros above + device-safe fixups only. */
+#define PPU_SDK_FIXUPS_POST
+#include "ppu_sdk_fixups.h"
+
+#elif defined(COMPAT_WRAPPER_HAS_PPU_SDK)
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <hggc.h>
+
+/* PPU SDK fixups — must come before other PPU SDK headers */
+#include "ppu_sdk_fixups.h"
+
+/* PPU SDK headers — C++ only (pure C third-party code may conflict) */
+#if defined(__cplusplus)
+
+#include <hgpti_result.h>
+#include <hgrtc.h>
+#include <hgJitLink.h>
+#include <hgTIXCompiler.h>
+#include <acblas_v2.h>
+#include <acfft.h>
+#include <acrand.h>
+#include <acsparse.h>
+#include <acsolver_common.h>
+#include <acsolverDn.h>
+#include <acdnn.h>
+#include <hgml.h>
+#include <hgpti_checkpoint.h>
+#include <hgpti_pcsampling_util.h>
+#include <hggc_library_types.h>
+#include <hgppdefs.h>
+#include <hgppcore.h>
+
+#endif /* __cplusplus */
+
+/* PPU SDK fixups (post-include phase) */
+#define PPU_SDK_FIXUPS_POST
+#include "ppu_sdk_fixups.h"
+
 /* ── GetVersion API stubs ── */
 
 #if defined(__cplusplus)
@@ -139,6 +178,15 @@ extern "C" {{
 static inline hggcError_t compatibleDriverGetVersion(int *driverVersion) {{
     if (driverVersion) *driverVersion = COMPATIBLE_VERSION;
     return (hggcError_t)0;
+}}
+
+/* cuDriverGetVersion is a driver API entry point: it returns HGresult (see
+ * hggc.h), not hggcError_t, so it cannot share compatibleDriverGetVersion.
+ * It still reports COMPATIBLE_VERSION (not the PPU driver version) so that
+ * CUDA-style version checks keep working. */
+static inline HGresult compatDriverGetVersion(int *driverVersion) {{
+    if (driverVersion) *driverVersion = COMPATIBLE_VERSION;
+    return HGGC_SUCCESS;
 }}
 
 static inline hggcError_t compatibleRuntimeGetVersion(int *runtimeVersion) {{
@@ -292,5 +340,7 @@ static inline acsolverStatus_t compatibleSolverGetProperty(hggcLibraryPropertyTy
 #endif
 
 #endif /* __cplusplus */
+
+#endif /* __HGGCCC_RTC__ / COMPAT_WRAPPER_HAS_PPU_SDK */
 
 #endif /* COMPATIBLE_WRAPPER_H */

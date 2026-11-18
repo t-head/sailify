@@ -1,0 +1,1 @@
+--extended-lambda -D__HGGCCC_EXTENDED_LAMBDA__ -std=c++17

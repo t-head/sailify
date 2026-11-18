@@ -5,7 +5,9 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from sailify.unsupported_stubs import generate_stubs as generator
 
@@ -74,7 +76,7 @@ class UnsupportedStubsTests(unittest.TestCase):
         config_path = Path(generator.__file__).with_name("unsupported_apis.json")
         with config_path.open() as config_file:
             apis = json.load(config_file)["apis"]
-        header = generator.generate_stubs_header()
+        header = generator.generate_stubs_header(stub_probe=False)
         self.assertEqual(len(apis), 1022)
         self.assertEqual(header.count("static inline "), len(apis))
         returning = 0
@@ -94,9 +96,39 @@ class UnsupportedStubsTests(unittest.TestCase):
 
     def test_write_stubs_header_uses_updated_generator(self):
         with tempfile.TemporaryDirectory() as output_dir:
-            header_path = generator.write_stubs_header(output_dir)
+            header_path = generator.write_stubs_header(output_dir, stub_probe=False)
             self.assertEqual(Path(header_path).name, "ppu_unsupported_stubs.h")
-            self.assertEqual(Path(header_path).read_text(), generator.generate_stubs_header())
+            self.assertEqual(Path(header_path).read_text(),
+                             generator.generate_stubs_header(stub_probe=False))
+
+    def test_no_probe_preserves_version_gated_status_returns(self):
+        with patch.object(generator, "probe_supported_apis") as probe:
+            header = generator.generate_stubs_header(stub_probe=False)
+        probe.assert_not_called()
+        self.assertIn("#if PPU_SDK_VERSION == 0 || PPU_SDK_VERSION <= 20299", header)
+        stub_start = header.index("static inline HGptiResult ")
+        stub_end = header.index("\n}", stub_start) + 2
+        self.assertIn("return HGPTI_ERROR_NOT_SUPPORTED;", header[stub_start:stub_end])
+        self.assertEqual(header[stub_end:stub_end + len("\n#endif")], "\n#endif")
+
+    def test_probe_drops_supported_apis_and_keeps_status_returns(self):
+        result = SimpleNamespace(supported={"acblasSetKernelStream"},
+                                 probed={"cublas", "cupti"})
+        with patch.object(generator, "probe_supported_apis", return_value=result) as probe:
+            header = generator.generate_stubs_header()
+        probe.assert_called_once()
+        self.assertNotIn("acblasSetKernelStream(", header)
+        self.assertIn("return ACBLAS_STATUS_NOT_SUPPORTED;", header)
+        self.assertIn("return HGPTI_ERROR_NOT_SUPPORTED;", header)
+        self.assertNotIn("#if PPU_SDK_VERSION == 0 || PPU_SDK_VERSION <= 20299", header)
+        self.assertEqual(header.count("static inline "), 1021)
+        self.assertEqual(header.count("exit(1);"), 24)
+
+    def test_probe_unavailable_keeps_gates_and_status_returns(self):
+        result = SimpleNamespace(supported=set(), probed=set())
+        with patch.object(generator, "probe_supported_apis", return_value=result):
+            header = generator.generate_stubs_header()
+        self.assertEqual(header, generator.generate_stubs_header(stub_probe=False))
 
     def test_generated_status_stubs_compile_and_return_in_c_and_cpp(self):
         # Minimal SDK stand-ins test syntax and runtime returns, not real SDK compatibility.

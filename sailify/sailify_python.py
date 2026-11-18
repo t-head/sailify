@@ -24,13 +24,23 @@ from typing import Iterable, Iterator, Optional, Dict, List
 
 from .cuda_to_ppu_mappings import (
     CUDA_TO_PPU_MAPPINGS,
+    PPU_SDK_2_2_IDENTIFIER_MAP,
+    PPU_SDK_2_3_RENAME_MAP,
 )
 from .unsupported_stubs import write_stubs_header
+from .ppu_sdk_version import (
+    detect_ppu_sdk_version,
+    detect_runtime_api_version,
+    format_version_string,
+    version_to_int,
+)
 
 __all__ = [
     "CurrentState",
     "SailifyResult",
     "Trie",
+    "COMPAT_WRAPPER_INCLUDE_LINE",
+    "compat_wrapper_include_line",
     "update_custom_mappings",
     "load_extra_mappings",
     "matched_files_iter",
@@ -47,7 +57,7 @@ log = logging.getLogger(__name__)
 # ── Default version configuration ─────────────────────────────────────
 # Default versions for the COMPATIBLE_XXX macros in compatible_wrapper.h.
 # These can be overridden via CLI (--cuda-version, etc.) or --config-json.
-DEFAULT_VERSION_CONFIG = {
+DEFAULT_VERSION_CONFIG_V3 = {
     "cuda": "13.0.0",
     "cublas": "13.0.0",
     "cufft": "12.0.0",
@@ -60,6 +70,26 @@ DEFAULT_VERSION_CONFIG = {
     "cupti": 130000,
     "npp": "13.0.50",
 }
+
+DEFAULT_VERSION_CONFIG_V2 = {
+    "cuda": "12.9.0",
+    "cublas": "12.9.0",
+    "cufft": "11.4.0",
+    "curand": "10.3.10",
+    "cusparse": "12.5.9",
+    "cusolver": "11.7.4",
+    "cudnn": "8.9.5",
+    "nccl": "2.27.3",
+    "video": "13.0.19",
+    "cupti": 120900,
+    "npp": "12.4.27",
+}
+
+
+def _default_version_config(runtime_api_version):
+    if runtime_api_version == 2:
+        return DEFAULT_VERSION_CONFIG_V2
+    return DEFAULT_VERSION_CONFIG_V3
 
 
 def _parse_version_string(version_str, encoding="cuda"):
@@ -96,9 +126,15 @@ def _parse_version_string(version_str, encoding="cuda"):
         raise ValueError(f"Unknown version encoding: {encoding}")
 
 
-def _generate_compat_wrapper_header(version_config=None):
-    """Generate the content of compatible_wrapper.h with the given version config."""
-    cfg = dict(DEFAULT_VERSION_CONFIG)
+def _generate_compat_wrapper_header(version_config=None, ppu_sdk_version=None,
+                                    runtime_api_version=None):
+    """Generate the content of compatible_wrapper.h with the given version config.
+
+    *ppu_sdk_version* is a (major, minor[, patch]) tuple of the PPU SDK
+    (detected by sailify or set via --ppu-sdk-version).  None means unknown
+    and yields PPU_SDK_VERSION 0, i.e. the legacy fixup behavior.
+    """
+    cfg = dict(_default_version_config(runtime_api_version))
     if version_config:
         cfg.update(version_config)
 
@@ -129,6 +165,14 @@ def _generate_compat_wrapper_header(version_config=None):
     cusolver_major, cusolver_minor, cusolver_patch = _ver_parts(cfg["cusolver"])
     nccl_major, nccl_minor, nccl_patch = _ver_parts(cfg["nccl"])
     npp_major, npp_minor, npp_build = _ver_parts(cfg["npp"])
+
+    if ppu_sdk_version:
+        ppu_sdk_major, ppu_sdk_minor, ppu_sdk_patch = \
+            (tuple(ppu_sdk_version) + (0, 0, 0))[:3]
+        ppu_sdk_str = format_version_string(ppu_sdk_version)
+    else:
+        ppu_sdk_major, ppu_sdk_minor, ppu_sdk_patch = 0, 0, 0
+        ppu_sdk_str = "unknown"
 
     tpl_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "compatible_wrapper.h.tpl")
@@ -164,19 +208,52 @@ def _generate_compat_wrapper_header(version_config=None):
         video_ver=video_ver,
         cupti_ver=cupti_ver,
         npp_major=npp_major, npp_minor=npp_minor, npp_build=npp_build,
+        ppu_sdk_str=ppu_sdk_str,
+        ppu_sdk_major=ppu_sdk_major,
+        ppu_sdk_minor=ppu_sdk_minor,
+        ppu_sdk_patch=ppu_sdk_patch,
     )
 
 
 # Static compat headers that ship alongside compatible_wrapper.h
-_COMPAT_STATIC_HEADERS = ["hgperf_common.h", "hgperf_host.h", "ppu_sdk_fixups.h", "mma.h"]
+_COMPAT_STATIC_HEADERS = ["hgperf_common.h", "hgperf_host.h", "ppu_sdk_fixups.h", "mma.h", "hggc_fp4.h", "hggc_device_runtime_api.h"]
+
+_SDK23_SHIM_HEADERS = [
+    ("hggc_channel_descriptor.h", "channel_descriptor.h"),
+    ("hggc_driver_functions.h", "driver_functions.h"),
+    ("hggc_driver_types.h", "driver_types.h"),
+    ("hggc_host_defines.h", "host_defines.h"),
+    ("hggc_vector_functions.h", "vector_functions.h"),
+    ("hggc_vector_functions.hpp", "vector_functions.hpp"),
+    ("hggc_vector_types.h", "vector_types.h"),
+    ("hggc_texture_types.h", "texture_types.h"),
+    ("hggc_texture_types.hpp", "hggc_texture_types.h"),
+]
 
 
-def write_compat_wrapper_header(compat_dir, version_config=None):
+def _generate_sdk_2_3_shim(name, fallback):
+    """Shim header for the PPU_SDK 2v3 renames: pass through to the SDK
+    header with the same name when it exists, otherwise forward to
+    *fallback* (the pre-rename spelling)."""
+    return (
+        f"#if __has_include_next(<{name}>)\n"
+        f"#include_next <{name}>\n"
+        "#else\n"
+        f"#include <{fallback}>\n"
+        "#endif\n"
+    )
+
+
+def write_compat_wrapper_header(compat_dir, version_config=None,
+                                ppu_sdk_version=None, runtime_api_version=None,
+                                stub_probe=True):
     """Write compatible_wrapper.h and static compat headers to compat_dir/."""
     os.makedirs(compat_dir, exist_ok=True)
     header_path = os.path.join(compat_dir, "compatible_wrapper.h")
 
-    content = _generate_compat_wrapper_header(version_config)
+    content = _generate_compat_wrapper_header(
+        version_config, ppu_sdk_version, runtime_api_version
+    )
     with open(header_path, "w") as f:
         f.write(content)
     if version_config:
@@ -184,7 +261,18 @@ def write_compat_wrapper_header(compat_dir, version_config=None):
     else:
         log.info("Generated default compatible_wrapper.h in %s", compat_dir)
 
-    write_stubs_header(compat_dir)
+    if stub_probe and ppu_sdk_version is not None:
+        detected = detect_ppu_sdk_version()
+        if detected is None or version_to_int(detected) != version_to_int(ppu_sdk_version):
+            log.warning(
+                "stub probe: requested PPU SDK %s differs from the installed %s; "
+                "falling back to version-gated legacy stubs",
+                format_version_string(ppu_sdk_version),
+                format_version_string(detected) if detected else "unknown",
+            )
+            stub_probe = False
+
+    write_stubs_header(compat_dir, stub_probe=stub_probe)
 
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     for hdr in _COMPAT_STATIC_HEADERS:
@@ -194,12 +282,41 @@ def write_compat_wrapper_header(compat_dir, version_config=None):
             shutil.copy2(src, dst)
             log.info("Copied %s to %s", hdr, compat_dir)
 
+    if ppu_sdk_version is not None and version_to_int(ppu_sdk_version) >= _SDK_2_3_VERSION_INT:
+        for name, fallback in _SDK23_SHIM_HEADERS:
+            with open(os.path.join(compat_dir, name), "w") as f:
+                f.write(_generate_sdk_2_3_shim(name, fallback))
+
 
 # ── File extensions ────────────────────────────────────────────────────
 DEFAULT_EXTENSIONS = (".cu", ".cuh", ".c", ".cc", ".cpp", ".h", ".hpp", ".inl")
 DEFAULT_HEADER_EXTENSIONS = (".cuh", ".h", ".hpp")
 
-SKIP_DIRS = {".git", "build", "__pycache__", ".tox", "node_modules"}
+SKIP_DIRS = {".git", "build", "__pycache__", ".tox", "node_modules", ".ppu_compat"}
+
+# Prepended to converted headers when inject_compat_include is enabled; resolves
+# via the include search path pointing at the PARENT of the compat dir.
+COMPAT_WRAPPER_INCLUDE_LINE = "#include <.ppu_compat/compatible_wrapper.h>"
+
+
+def compat_wrapper_include_line(compat_dir: str) -> str:
+    """Wrapper include line for *compat_dir* (its basename is the path segment)."""
+    name = os.path.basename(os.path.normpath(compat_dir))
+    return f"#include <{name}/compatible_wrapper.h>"
+
+
+_COMPAT_INCLUDE_LINE_RE = re.compile(
+    r"^[ \t]*#[ \t]*include[ \t]*<[^\r\n>]*compatible_wrapper\.h>[ \t]*\r?\n?",
+    re.MULTILINE,
+)
+
+
+def _inject_compat_include(source: str, include_line: str = COMPAT_WRAPPER_INCLUDE_LINE) -> str:
+    """Prepend *include_line*, replacing any wrapper include left by an earlier run."""
+    has_bom = source.startswith("\ufeff")
+    body = source[1:] if has_bom else source
+    body = _COMPAT_INCLUDE_LINE_RE.sub("", body)
+    return ("\ufeff" if has_bom else "") + include_line + "\n" + body
 
 class CurrentState(Enum):
     INITIALIZED = 1
@@ -300,6 +417,57 @@ for _mapping in CUDA_TO_PPU_MAPPINGS:
 _RE_PPU_PREPROCESSOR = re.compile(
     r"(?<!\w)(" + _PPU_TRIE.export_to_regex() + r")(?!\w)"
 )
+
+# ── SDK-version-conditional mappings (PPU SDK >= 2.2) ─────────────────
+
+_SDK_2_2_VERSION_INT = 20200  # version_to_int((2, 2, 0))
+
+_SDK22_MAP: Dict[str, str] = {}
+_SDK22_RE: Optional[re.Pattern] = None
+
+
+def _enable_sdk_2_2_mappings() -> None:
+    """Activate the PPU SDK >= 2.2 identifier group (idempotent)."""
+    global _SDK22_MAP, _SDK22_RE
+    if _SDK22_RE is not None:
+        return
+    trie = Trie()
+    mapping = {}
+    for src, dst in PPU_SDK_2_2_IDENTIFIER_MAP.items():
+        trie.add(src)
+        mapping[src] = dst
+    _SDK22_MAP = mapping
+    _SDK22_RE = re.compile(r"(?<!\w)(" + trie.export_to_regex() + r")(?!\w)")
+
+
+def _maybe_enable_sdk_2_2_mappings(ppu_sdk_version) -> None:
+    global _SDK22_MAP, _SDK22_RE
+    if ppu_sdk_version is not None and version_to_int(ppu_sdk_version) >= _SDK_2_2_VERSION_INT:
+        _enable_sdk_2_2_mappings()
+    else:
+        _SDK22_MAP = {}
+        _SDK22_RE = None
+
+
+# ── SDK-version-conditional renames (PPU_SDK 2v3) ─────────────────────
+
+_SDK_2_3_VERSION_INT = 20300  # version_to_int((2, 3, 0))
+
+_SDK23_RENAME_ACTIVE = False
+
+
+def _maybe_enable_sdk_2_3_mappings(ppu_sdk_version) -> None:
+    global _SDK23_RENAME_ACTIVE
+    _SDK23_RENAME_ACTIVE = (
+        ppu_sdk_version is not None
+        and version_to_int(ppu_sdk_version) >= _SDK_2_3_VERSION_INT
+    )
+
+
+def _maybe_enable_sdk_version_mappings(ppu_sdk_version) -> None:
+    _maybe_enable_sdk_2_2_mappings(ppu_sdk_version)
+    _maybe_enable_sdk_2_3_mappings(ppu_sdk_version)
+
 
 # ── Custom mapping support ────────────────────────────────────────────
 
@@ -457,7 +625,7 @@ def get_ppu_file_path(rel_filepath: str) -> str:
 
 
 def _mask_comments_and_strings(source: str) -> str:
-    """Replace characters inside comments, string literals, and char literals with 'x'."""
+    """Mask comments and char literals with 'x' to gate identifier replacement."""
     n = len(source)
     in_include = [False] * n
     line_start = 0
@@ -578,15 +746,15 @@ def _mask_comments_and_strings(source: str) -> str:
 
         elif in_context == '"':
             if c == '\\':
-                result.append('x')
+                result.append(c)
                 i += 1
                 if i < n:
-                    result.append('x')
+                    result.append(source[i])
                     i += 1
                 continue
             if c == '"':
                 in_context = ''
-            result.append('x')
+            result.append(c)
             i += 1
 
         elif in_context == "'":
@@ -607,14 +775,15 @@ def _mask_comments_and_strings(source: str) -> str:
             close_seq = ')' + delim + '"'
             close_pos = source.find(close_seq, i)
             if close_pos == -1:
-                for _ in range(i, n):
-                    result.append('x')
+                for j in range(i, n):
+                    result.append(source[j])
                 i = n
             else:
-                end = close_pos + len(close_seq)
-                for _ in range(i, end):
+                for j in range(i, close_pos):
+                    result.append(source[j])
+                for _ in range(close_pos, close_pos + len(close_seq)):
                     result.append('x')
-                i = end
+                i = close_pos + len(close_seq)
                 in_context = ''
         else:
             result.append(c)
@@ -635,11 +804,15 @@ def _rewrite_include_directives(source: str) -> str:
     from .cuda_to_ppu_mappings import CUDA_INCLUDE_MAP
 
     _inc_re = re.compile(
-        r'^([ \t]*#[ \t]*include[ \t]+[<"])([^>"]+)([>"])',
+        r'^([ \t]*#[ \t]*include[ \t]*[<"])([^>"]+)([>"])',
         re.MULTILINE,
     )
 
-    _sorted_pairs = sorted(CUDA_INCLUDE_MAP.items(), key=lambda kv: -len(kv[0]))
+    if _SDK23_RENAME_ACTIVE:
+        pairs = list(CUDA_INCLUDE_MAP.items()) + list(PPU_SDK_2_3_RENAME_MAP.items())
+    else:
+        pairs = CUDA_INCLUDE_MAP.items()
+    _sorted_pairs = sorted(pairs, key=lambda kv: -len(kv[0]))
 
     def _replace(match):
         prefix = match.group(1)
@@ -690,8 +863,18 @@ def preprocessor(
     show_progress: bool,
     project_directory: str = "",
     backup: bool = False,
+    inject_compat_include: bool = False,
+    inject_compat_include_ignores: Iterable[str] = (),
+    compat_include_line: str = COMPAT_WRAPPER_INCLUDE_LINE,
 ) -> SailifyResult:
-    """Process a single CUDA source file and write the PPU equivalent."""
+    """Process a single CUDA source file and write the PPU equivalent.
+
+    With *inject_compat_include*, header files (.h/.hpp/.cuh) additionally get
+    the compat wrapper include (*compat_include_line*) prepended.
+
+    *inject_compat_include_ignores* — glob patterns (relative to
+    *project_directory*) of headers to exempt from the injection.
+    """
     if project_directory:
         rel = os.path.relpath(filepath, project_directory)
     else:
@@ -740,8 +923,31 @@ def preprocessor(
     _new_parts.append(output_source[_last_end:])
     output_source = "".join(_new_parts)
 
+    # 2b. Apply the SDK >= 2.2 identifier group (enabled when the detected
+    # SDK version is 2.2+)
+    if _SDK22_MAP and _SDK22_RE is not None:
+        _masked22 = _mask_comments_and_strings(output_source)
+        _new_parts = []
+        _last_end = 0
+        for _m in _SDK22_RE.finditer(output_source):
+            if _masked22[_m.start()] == 'x':
+                continue
+            _new_parts.append(output_source[_last_end:_m.start()])
+            _new_parts.append(_SDK22_MAP.get(_m.group(1), _m.group(1)))
+            _last_end = _m.end()
+        _new_parts.append(output_source[_last_end:])
+        output_source = "".join(_new_parts)
+
     for _pat, _repl in _EXTRA_MAPPING_LISTS:
         output_source = output_source.replace(_pat, _repl)
+
+    if (
+        inject_compat_include
+        and os.path.splitext(filepath)[1] in DEFAULT_HEADER_EXTENSIONS
+        and not any(_matches_pattern(rel.replace(os.sep, "/"), pat)
+                    for pat in inject_compat_include_ignores)
+    ):
+        output_source = _inject_compat_include(output_source, compat_include_line)
 
     # Write output
     try:
@@ -808,6 +1014,18 @@ def _copytree_compat(src, dst, ignore=None):
 
 # ── Main entry point ─────────────────────────────────────────────────
 
+def _print_detected_versions(ppu_sdk_version, runtime_api_version):
+    if ppu_sdk_version:
+        print(f"sailify: PPU SDK {format_version_string(ppu_sdk_version)} detected "
+              f"(PPU_SDK_VERSION {version_to_int(ppu_sdk_version)})")
+    else:
+        print("sailify: PPU SDK version unknown; keeping legacy fixups "
+              "(set $PPU_SDK or pass --ppu-sdk-version)")
+    cuda_default = "12.9" if runtime_api_version == 2 else "13.0"
+    print(f"sailify: hggcrt Runtime API v{runtime_api_version} "
+          f"(COMPATIBLE_* defaults follow CUDA {cuda_default})")
+
+
 def sailify(
     project_directory: str,
     output_directory: str = "",
@@ -820,10 +1038,31 @@ def sailify(
     backup: bool = False,
     install_ppu_compat: bool = True,
     ppu_compat_dir: str = "",
+    inject_compat_include: bool = False,
+    inject_compat_include_ignores: list = None,
     extra_mapping: str = "",
     verbose: bool = False,
+    ppu_sdk_version: tuple = None,
+    stub_probe: bool = True,
 ) -> dict:
-    """Convert CUDA code to PPU code in the given project directory."""
+    """Convert CUDA code to PPU code in the given project directory.
+
+    *ppu_sdk_version* — explicit (major, minor[, patch]) PPU SDK tuple for
+    the version-conditional fixups.  When None it is auto-detected from the
+    environment (see ppu_sdk_version.detect_ppu_sdk_version).
+
+    *stub_probe* — when True (default), stub only APIs the installed SDK
+    does not export (see unsupported_stubs.probe); when False, emit every
+    unsupported_apis.json entry with its version gate.
+
+    *inject_compat_include* — prepend the compat wrapper include to every
+    converted header (.h/.hpp/.cuh).  The path segment follows the name of
+    *ppu_compat_dir* (default ``.ppu_compat``); consumers must put the PARENT
+    of the compat dir on their include search path.
+
+    *inject_compat_include_ignores* — glob patterns (relative to
+    *project_directory*) of headers exempt from the injection.
+    """
     if not os.path.isdir(project_directory):
         raise FileNotFoundError(f"Project directory not found: {project_directory}")
 
@@ -854,6 +1093,13 @@ def sailify(
         else:
             output_directory = project_directory
 
+        compat_dir = ppu_compat_dir or os.path.join(output_directory, ".ppu_compat")
+        include_line = compat_wrapper_include_line(compat_dir)
+        _compat_dir_name = os.path.basename(os.path.normpath(compat_dir))
+        if _compat_dir_name not in SKIP_DIRS:
+            SKIP_DIRS.add(_compat_dir_name)
+            _added_skip_dirs.append(_compat_dir_name)
+
         _includes = includes or ["*"]
         _ignores = ignores or []
 
@@ -869,9 +1115,25 @@ def sailify(
         if version_config is None:
             version_config = {}
 
+        if ppu_sdk_version is None:
+            ppu_sdk_version = detect_ppu_sdk_version()
+        _maybe_enable_sdk_version_mappings(ppu_sdk_version)
         if install_ppu_compat:
-            compat_dir = ppu_compat_dir or os.path.join(output_directory, ".ppu_compat")
-            write_compat_wrapper_header(compat_dir, version_config if version_config else None)
+            runtime_api_version = detect_runtime_api_version()
+            _print_detected_versions(ppu_sdk_version, runtime_api_version)
+            write_compat_wrapper_header(
+                compat_dir,
+                version_config if version_config else None,
+                ppu_sdk_version=ppu_sdk_version,
+                runtime_api_version=runtime_api_version,
+                stub_probe=stub_probe,
+            )
+        elif inject_compat_include:
+            log.warning(
+                "inject_compat_include is on but install_ppu_compat is off: converted "
+                "headers will reference %s which is not generated in this run.",
+                include_line,
+            )
 
         results = {}
 
@@ -885,6 +1147,9 @@ def sailify(
                 show_progress=verbose,
                 project_directory=project_directory,
                 backup=backup,
+                inject_compat_include=inject_compat_include,
+                inject_compat_include_ignores=inject_compat_include_ignores or [],
+                compat_include_line=include_line,
             )
             results[os.path.abspath(filepath)] = res
 
@@ -899,18 +1164,36 @@ def sailify(
     return results
 
 
+def _ensure_ppu_compat(output_directory: str, stub_probe: bool = True) -> None:
+    """(Re)generate .ppu_compat in output_directory with the detected PPU SDK version."""
+    compat_dir = os.path.join(output_directory, ".ppu_compat")
+    ppu_sdk_version = detect_ppu_sdk_version()
+    _maybe_enable_sdk_version_mappings(ppu_sdk_version)
+    runtime_api_version = detect_runtime_api_version()
+    _print_detected_versions(ppu_sdk_version, runtime_api_version)
+    write_compat_wrapper_header(compat_dir, ppu_sdk_version=ppu_sdk_version,
+                                runtime_api_version=runtime_api_version,
+                                stub_probe=stub_probe)
+
+
 def sailify_extra_files(
     output_directory: str,
     extra_files: list,
     show_detailed: bool = False,
+    install_ppu_compat: bool = True,
+    inject_compat_include: bool = False,
+    inject_compat_include_ignores: list = None,
+    stub_probe: bool = True,
 ) -> dict:
     """Sailify only the specified extra_files.
 
     Converts a list of user-provided CUDA source files in-place and returns
     a dict mapping absolute input path -> SailifyResult.
-
     """
     output_directory = os.path.abspath(output_directory)
+    _maybe_enable_sdk_version_mappings(detect_ppu_sdk_version())
+    if install_ppu_compat:
+        _ensure_ppu_compat(output_directory, stub_probe=stub_probe)
     stats: Dict[str, list] = {}
     results = {}
 
@@ -924,6 +1207,8 @@ def sailify_extra_files(
             clean_ctx=None,
             show_progress=show_detailed,
             project_directory=output_directory,
+            inject_compat_include=inject_compat_include,
+            inject_compat_include_ignores=inject_compat_include_ignores or [],
         )
         results[filepath] = res
 
@@ -973,6 +1258,8 @@ def _discover_includes(
             if candidate in visited:
                 break
             if os.path.isfile(candidate):
+                if ".ppu_compat" in candidate.split(os.sep):
+                    break
                 ext = os.path.splitext(candidate)[1]
                 if ext in DEFAULT_EXTENSIONS:
                     visited.add(candidate)
@@ -986,6 +1273,10 @@ def sailify_extra_files_recursive(
     header_include_dirs: list = None,
     show_detailed: bool = False,
     backup: bool = False,
+    install_ppu_compat: bool = True,
+    inject_compat_include: bool = False,
+    inject_compat_include_ignores: list = None,
+    stub_probe: bool = True,
 ) -> dict:
     """Sailify extra_files with recursive #include dependency discovery.
 
@@ -1000,11 +1291,19 @@ def sailify_extra_files_recursive(
         header_include_dirs: Directories to search for #include'd headers.
         show_detailed: If True, log each file conversion.
         backup: If True, create .bak backups of files processed in-place.
+        install_ppu_compat: If True, (re)generate .ppu_compat in output_directory.
+        inject_compat_include: If True, prepend the .ppu_compat wrapper
+            include to converted headers (see sailify()).
+        inject_compat_include_ignores: Glob patterns of headers exempt from
+            the injection (see sailify()).
 
     Returns:
         Dict mapping absolute input path -> SailifyResult.
     """
     output_directory = os.path.abspath(output_directory)
+    _maybe_enable_sdk_version_mappings(detect_ppu_sdk_version())
+    if install_ppu_compat:
+        _ensure_ppu_compat(output_directory, stub_probe=stub_probe)
     _header_include_dirs = header_include_dirs or []
     stats: Dict[str, list] = {}
     results = {}
@@ -1038,6 +1337,8 @@ def sailify_extra_files_recursive(
             show_progress=show_detailed,
             project_directory=output_directory,
             backup=backup,
+            inject_compat_include=inject_compat_include,
+            inject_compat_include_ignores=inject_compat_include_ignores or [],
         )
         results[filepath] = res
         processed_count += 1

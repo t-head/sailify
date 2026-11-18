@@ -51,6 +51,8 @@ sailify --config-json config.json
 | `--backup` | Create .bak backup files before in-place conversion |
 | `--no-ppu-compat` | Skip generating .ppu_compat/ compat headers |
 | `--ppu-compat-dir` | Custom directory for .ppu_compat headers (default: `<output>/.ppu_compat`) |
+| `--inject-compat-include` | Prepend `#include <.ppu_compat/compatible_wrapper.h>` to every converted header so builds no longer need `-include compatible_wrapper.h`; the path segment follows the `--ppu-compat-dir` name, and the include search path must point at the compat dir's parent |
+| `--inject-compat-include-ignore` | Glob patterns (relative to project root) of headers exempt from the injection. Repeatable; also available as `inject_compat_include_ignores` in the config JSON |
 | `--cuda-version` | CUDA version for COMPATIBLE_VERSION macro |
 | `--cublas-version` | cuBLAS version |
 | `--cufft-version` | cuFFT version |
@@ -61,6 +63,14 @@ sailify --config-json config.json
 | `--nccl-version` | NCCL version |
 | `--video-version` | Video Codec SDK version |
 | `--cupti-version` | CUPTI API version number |
+| `--npp-version` | NPP version |
+| `--ppu-sdk-version` | PPU SDK version for conditional fixups (e.g. `2.2` or `2v2`). Auto-detected when omitted |
+| `--stub-probe` | `on` (default) / `off`. `on`: probe the installed SDK and stub only APIs it does not export. `off`: emit every `unsupported_apis.json` entry with its version gate |
+
+When no `--*-version` option is given, the `COMPATIBLE_*` defaults follow the
+detected hggcrt Runtime API version: `Runtime API version vN` from
+`hgcc --version`, else an `hggcrt_version:vN` line in `$PPU_PATH/VERSION.txt`,
+else v3.
 
 ### Python API
 
@@ -73,6 +83,7 @@ results = sailify(
     excludes=["third_party"],
     version_config={"cuda": "13.0.0", "cudnn": "8.9.5"},
     install_ppu_compat=True,
+    inject_compat_include=True,
     verbose=True,
 )
 ```
@@ -107,6 +118,27 @@ When `install_ppu_compat=True` (default), sailify generates compatibility header
 ```bash
 hgcc -I/path/to/output/.ppu_compat -include compatible_wrapper.h ...
 ```
+
+Alternatively, `--inject-compat-include` embeds `#include <.ppu_compat/compatible_wrapper.h>` as the first line of every converted header (idempotent across re-runs), so only `-I/path/to/output` — the compat dir's parent — is needed.
+
+### PPU SDK Version Detection
+
+`ppu_sdk_fixups.h` contains shims whose behavior depends on the PPU SDK release. sailify resolves the SDK version when generating `.ppu_compat/` and bakes it into `compatible_wrapper.h` as `PPU_SDK_VERSION` (`major * 10000 + minor * 100 + patch`, e.g. 2.1 → 20100, 2.1.1 → 20101, 2.2 → 20200; 0 = unknown):
+
+1. `--ppu-sdk-version` (CLI) / `ppu_sdk_version` (config JSON / `sailify()` keyword) — explicit, wins over everything.
+2. `hgcc --version` — the compiler is located via `hgcc` on `PATH`, then `$PPU_SDK/bin`, then `$PPU_HOME/bin`.
+
+If none succeed, `PPU_SDK_VERSION` is 0 and the legacy fixup behavior is kept; a warning is logged at conversion time. The macro can also be overridden at compile time with `-DPPU_SDK_VERSION=...`.
+
+## Unsupported-API Stub Probing
+
+By default (`--stub-probe on`, `stub_probe` in the config JSON, `sailify(stub_probe=True)`) sailify probes the installed SDK at conversion time: an API exported by a host library (`nm -D` over e.g. `libacblas.so`, `libacdnn.so`) counts as supported and its stub is dropped. The SDK is located via hgcc on PATH (symlinks resolved, taking its `../lib`), else via `$PPU_PATH`/`$PPU_SDK`/`$PPU_HOME` (in that order); a candidate directory counts only if it contains a known PPU host library, and when hgcc on PATH is a wrapper the environment SDK must report the same `hgcc --version` — otherwise the legacy stubs are kept and only that one installation is ever probed. APIs whose library cannot be probed (no host `.so`, unreadable symbols, or no SDK found — e.g. cufftw, cufile) keep their stubs **with their version gates**, so an SDK that gains APIs needs no JSON bookkeeping.
+
+`--stub-probe off` restores the legacy behavior: every JSON entry with its `version` begin/end gate, evaluated at compile time via `PPU_SDK_VERSION`.
+
+Set `SAILIFY_STUB_PROBE_REPORT` to print which APIs the SDK already supports (stubs dropped).
+
+Probing happens at conversion time; if you later compile against a different SDK, re-run sailify or use `--stub-probe off`. Likewise, an explicit `--ppu-sdk-version` that differs from the installed SDK (or cannot be verified) disables probing and restores the version-gated legacy stubs — the probe only ever describes the SDK that is actually installed.
 
 ## License
 

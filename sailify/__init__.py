@@ -6,6 +6,6 @@ CUDA SDK identifiers, types, and API calls with their PPU SDK equivalents.
 """
 
 from .version import __version__
-from .nvcc_hgcc_options import NVCC_HGCC_OPTIONS
+from .nvcc_hgcc_options import NVCC_HGCC_OPTIONS, translate_nvcc_options
 
-__all__ = ['__version__', 'NVCC_HGCC_OPTIONS']
+__all__ = ['__version__', 'NVCC_HGCC_OPTIONS', 'translate_nvcc_options']

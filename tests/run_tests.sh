@@ -153,6 +153,30 @@ for c in hello_kernel vector_add shared_reduce ext_lambda events_api header_user
   fi
 done
 
+echo "== phase 3b: compile with translated nvcc options =="
+if ! "$PYTHON" "${SCRIPT_DIR}/lib/map_flags.py" -c -std=c++14 -O2 --extended-lambda \
+  -Xptxas=--split-compile=0 --ptxas-options=-v,--register-usage-level=10 \
+  -Wno-deprecated-declarations -Xptxas --maxrregcount=64 -Xptxas -v \
+  -Xptxas --maxntid 64 \
+  > "${OUT}/trans_flags.txt"; then
+  echo "FAIL translate flags"
+  let FAIL=FAIL+1
+else
+  TFLAGS=""
+  while read -r a; do
+    TFLAGS="${TFLAGS} ${a}"
+  done < "${OUT}/trans_flags.txt"
+  echo "translated flags:${TFLAGS}"
+  read -r cuf < "${OUT}/vector_add.found" || true
+  if [ -n "${cuf}" ] && "${HGCC}" ${TFLAGS} ${INC} ${WRAP} "${cuf}" -o "${OUT}/obj/vector_add_trans.o" 2> "${OUT}/logs/vector_add_trans.log"; then
+    echo "PASS compile translated options"
+    let PASS=PASS+1
+  else
+    echo "FAIL compile translated options (see ${OUT}/logs/vector_add_trans.log)"
+    let FAIL=FAIL+1
+  fi
+fi
+
 echo "== phase 4: compile converted cli_project =="
 INC2="-I${OUT}/cli"
 WRAP2=""

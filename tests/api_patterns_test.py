@@ -587,30 +587,314 @@ def test_versioned_runtime_api_conversion(tmp):
     return failures
 
 
-def test_nvcc_flag_mapping():
-    out = translate([
-        "-c", "-O2", "-std=c++17", "-t=0",
-        "--expt-relaxed-constexpr", "--use_fast_math",
-        "--ptxas-options", "-warn-spills",
-        "--source-in-ptx",
-        "-Xcompiler", "-O3",
-    ])
+def test_nvcc_flag_mapping(tmp):
+    from sailify import translate_nvcc_options
     failures = []
-    if "--llvm-options" not in out:
-        failures.append("--ptxas-options not mapped to --llvm-options")
-    idx = out.index("--llvm-options") if "--llvm-options" in out else -1
-    if idx >= 0 and (idx + 1 >= len(out) or out[idx + 1] != "-ppu-warn-spills"):
-        failures.append("--ptxas-options value not remapped to -ppu-warn-spills")
-    if "--source-in-ptx" in out:
-        failures.append("--source-in-ptx not dropped")
-    for passthrough in ("-c", "-O2", "-std=c++17", "-t=0",
-                        "--expt-relaxed-constexpr", "--use_fast_math",
-                        "-Xcompiler", "-O3"):
-        if passthrough not in out:
-            failures.append(passthrough + " should pass through unchanged")
-    out2 = translate(["--ptxas-options=--warn-on-spills", "--resource-usage", "--keep"])
-    if out2 != ["--ptxas-options=--warn-on-spills", "--resource-usage", "--keep"]:
-        failures.append("unrecognised flags should pass through unchanged: " + str(out2))
+
+    def expect(name, actual, wanted):
+        if actual != wanted:
+            failures.append(name + ": got " + str(actual) + ", want " + str(wanted))
+
+    # passthrough + classic separated/short forms
+    expect(
+        "classic passthrough",
+        translate([
+            "-c", "-O2", "-std=c++17", "-t=0",
+            "--expt-relaxed-constexpr", "--use_fast_math",
+            "--ptxas-options", "-warn-spills",
+            "--source-in-ptx",
+            "-Xcompiler", "-O3",
+        ]),
+        ["-c", "-O2", "-std=c++17", "-t=0",
+         "--expt-relaxed-constexpr", "--use_fast_math",
+         "-Xcompiler", "-O3",
+         "--llvm-options", "-ppu-warn-spills"],
+    )
+
+    # short form with a single value
+    expect(
+        "short -Xptxas single value",
+        translate_nvcc_options(["-Xptxas", "-v"]),
+        ["--llvm-options", "--resource-usage"],
+    )
+
+    # joined '=' form whose value itself contains '=' (split at first '=')
+    expect(
+        "joined unknown value dropped",
+        translate_nvcc_options(["-Xptxas=--split-compile=0", "--keep"]),
+        ["--keep"],
+    )
+
+    # comma-delimited value list: recognised element translated, unknown dropped
+    expect(
+        "comma list mixed known/unknown",
+        translate_nvcc_options(["--ptxas-options=-v,--register-usage-level=10"]),
+        ["--llvm-options", "--resource-usage"],
+    )
+    expect(
+        "comma list two known values",
+        translate_nvcc_options(["-Xptxas=-v,--def-load-cache=ca"]),
+        ["--llvm-options", "--resource-usage", "--llvm-options", "-ppu-dlcm=0"],
+    )
+
+    # prefix-key value rules: single operands resolved as a whole
+    expect(
+        "maxrregcount prefix rule",
+        translate_nvcc_options(["-Xptxas", "--maxrregcount=64"]),
+        ["--llvm-options", "-ppu-max-vreg-count=64"],
+    )
+    expect(
+        "maxntid single dimension",
+        translate_nvcc_options(["-Xptxas", "--maxntid=128"]),
+        ["--llvm-options", "-ppu-maxntid=128"],
+    )
+    expect(
+        "maxntid multi-dimension dropped (unrepresentable single-uint target)",
+        translate_nvcc_options(["-Xptxas", "--maxntid=128,4"]),
+        [],
+    )
+    expect(
+        "minnctapersm prefix rule",
+        translate_nvcc_options(["-Xptxas", "--minnctapersm=2"]),
+        ["--llvm-options", "-ppu-minblockscu=2"],
+    )
+    expect(
+        "ptxas warning-as-error",
+        translate_nvcc_options(["-Xptxas", "--warning-as-error"]),
+        ["--llvm-options", "-fatal-warnings"],
+    )
+    expect(
+        "ptxas -w",
+        translate_nvcc_options(["-Xptxas", "-w"]),
+        ["--llvm-options", "--no-warn"],
+    )
+    expect(
+        "disable-warnings",
+        translate_nvcc_options(["-Xptxas", "--disable-warnings"]),
+        ["--llvm-options", "--no-warn"],
+    )
+
+    # ptxas drop rules consume the value together with the key
+    expect(
+        "ptxas register-usage-level dropped with value",
+        translate_nvcc_options(["-Xptxas", "--register-usage-level=10", "--keep"]),
+        ["--keep"],
+    )
+    expect(
+        "ptxas position-independent-code dropped",
+        translate_nvcc_options(["-Xptxas", "--position-independent-code", "--keep"]),
+        ["--keep"],
+    )
+
+    # --Werror: comma lists split per kind, ignored kinds dropped
+    expect(
+        "Werror single kind",
+        translate_nvcc_options(["--Werror", "reorder"]),
+        ["--Werror", "reorder"],
+    )
+    expect(
+        "Werror comma list with ignored kind",
+        translate_nvcc_options(["--Werror", "reorder,cross-execution-space-call"]),
+        ["--Werror", "reorder"],
+    )
+    expect(
+        "Werror ignored kind alone",
+        translate_nvcc_options(["--Werror", "cross-execution-space-call"]),
+        [],
+    )
+
+    # dropped with value: no hgcc --fsanitize/--apply-controls on this SDK
+    expect(
+        "sanitize dropped",
+        translate_nvcc_options(["--sanitize", "memcheck"]),
+        [],
+    )
+    expect(
+        "apply-controls dropped",
+        translate_nvcc_options(["--apply-controls", "off"]),
+        [],
+    )
+
+    # -gencode is arch-targeting; callers pass --gpu-architecture instead
+    expect(
+        "gencode dropped with value",
+        translate_nvcc_options(["-gencode", "arch=compute_80,code=sm_80"]),
+        [],
+    )
+
+    # ignored flags, with and without values, long and short
+    expect(
+        "ignored with value (short)",
+        translate_nvcc_options(["--diag-suppress", "1234", "-Wno-deprecated-declarations"]),
+        [],
+    )
+    expect(
+        "ignored joined form",
+        translate_nvcc_options(["--diag-suppress=1234"]),
+        [],
+    )
+
+    # -Xcompiler value forwarded raw (hgcc splits commas itself)
+    expect(
+        "Xcompiler raw value",
+        translate_nvcc_options(["-Xcompiler", "-fPIC,-std=c++17"]),
+        ["-Xcompiler", "-fPIC,-std=c++17"],
+    )
+
+    # whole option string input (shlex-split)
+    expect(
+        "string input",
+        translate_nvcc_options("-O3 -std=c++17 -Xptxas -v,--register-usage-level=10 -Wno-deprecated-declarations"),
+        ["-O3", "-std=c++17", "--llvm-options", "--resource-usage"],
+    )
+
+    # repeated -Xptxas occurrences accumulate
+    expect(
+        "repeated occurrences",
+        translate_nvcc_options(["-Xptxas", "-v", "-Xptxas", "-dlcm=cg"]),
+        ["--llvm-options", "--resource-usage", "--llvm-options", "-ppu-dlcm=2"],
+    )
+
+    # mixed comma lists: dropped keys must not swallow the other elements,
+    # and dimension operands stay with their key in both orderings
+    expect(
+        "comma list maxrregcount then -v",
+        translate_nvcc_options(["-Xptxas=--maxrregcount=64,-v"]),
+        ["--llvm-options", "-ppu-max-vreg-count=64", "--llvm-options", "--resource-usage"],
+    )
+    expect(
+        "comma list dropped key then -v",
+        translate_nvcc_options(["-Xptxas=--register-usage-level=10,-v"]),
+        ["--llvm-options", "--resource-usage"],
+    )
+    expect(
+        "comma list -v then multi-dim maxntid",
+        translate_nvcc_options(["-Xptxas=-v,--maxntid=128,4"]),
+        ["--llvm-options", "--resource-usage"],
+    )
+    expect(
+        "comma list multi-dim maxntid then -v",
+        translate_nvcc_options(["-Xptxas=--maxntid=128,4,-v"]),
+        ["--llvm-options", "--resource-usage"],
+    )
+
+    # operand-taking keys pair with a following bare value, in every form
+    # nvcc accepts: separated, comma-joined, and across repeated occurrences
+    expect(
+        "operand paired after key",
+        translate_nvcc_options(["-Xptxas", "--maxrregcount", "64", "-c", "a.cu"]),
+        ["-c", "a.cu", "--llvm-options", "-ppu-max-vreg-count=64"],
+    )
+    expect(
+        "operand paired via comma",
+        translate_nvcc_options(["-Xptxas=--maxrregcount,64"]),
+        ["--llvm-options", "-ppu-max-vreg-count=64"],
+    )
+    expect(
+        "operand paired across occurrences",
+        translate_nvcc_options(["-Xptxas", "--maxrregcount", "-Xptxas", "64"]),
+        ["--llvm-options", "-ppu-max-vreg-count=64"],
+    )
+    expect(
+        "maxntid separated operand",
+        translate_nvcc_options(["-Xptxas", "--maxntid", "128"]),
+        ["--llvm-options", "-ppu-maxntid=128"],
+    )
+
+    # space-separated option list inside one value, like a quoted -Xptxas arg
+    expect(
+        "space-separated list value",
+        translate_nvcc_options("-Xptxas '-v -w'"),
+        ["--llvm-options", "--resource-usage", "--llvm-options", "--no-warn"],
+    )
+
+    # --options-file contents are spliced in and translated
+    optfile = os.path.join(tmp, "nvcc.opts")
+    with open(optfile, "w") as fh:
+        fh.write("-Xptxas -v\n-O3 -std=c++14\n")
+    expect(
+        "options-file contents spliced in",
+        translate_nvcc_options(["-optf", optfile, "-c", "a.cu"]),
+        ["-O3", "-std=c++14", "-c", "a.cu", "--llvm-options", "--resource-usage"],
+    )
+    expect(
+        "options-file joined spelling",
+        translate_nvcc_options(["--options-file=" + optfile, "-c", "a.cu"]),
+        ["-O3", "-std=c++14", "-c", "a.cu", "--llvm-options", "--resource-usage"],
+    )
+    try:
+        translate_nvcc_options(["-optf", os.path.join(tmp, "missing.opts")])
+        failures.append("options-file missing file: no error raised")
+    except FileNotFoundError:
+        pass
+
+    # repeated values dedupe across occurrences, long/short spellings alike;
+    # a repeated setting keeps its final value (hgcc rejects repeats)
+    expect(
+        "duplicate -v across spellings deduped",
+        translate_nvcc_options(["-Xptxas", "-v", "--ptxas-options=-v", "-Xptxas", "-v"]),
+        ["--llvm-options", "--resource-usage"],
+    )
+    expect(
+        "repeated setting keeps final value",
+        translate_nvcc_options(["-Xptxas=-dlcm=cg,-dlcm=ca,-dlcm=cg"]),
+        ["--llvm-options", "-ppu-dlcm=2"],
+    )
+    expect(
+        "distinct settings survive",
+        translate_nvcc_options(["-Xptxas", "-v", "-Xptxas", "-dlcm=cg"]),
+        ["--llvm-options", "--resource-usage", "--llvm-options", "-ppu-dlcm=2"],
+    )
+
+    # forwarding flags registered with their operand
+    expect(
+        "Xpreprocessor forwards operand",
+        translate_nvcc_options(["-Xpreprocessor", "-DFOO=1", "-c", "a.cu"]),
+        ["-Xpreprocess", "-DFOO=1", "-c", "a.cu"],
+    )
+
+    # restored exported entries
+    expect(
+        "device-debug mapping restored",
+        translate_nvcc_options(["--device-debug"]),
+        ["-G", "-D__CUDACC_DEBUG__"],
+    )
+    expect(
+        "relocatable-link mapping restored",
+        translate_nvcc_options(["--relocatable-link"]),
+        ["-r"],
+    )
+    expect(
+        "dopt mapping restored",
+        translate_nvcc_options(["--dopt", "on"]),
+        ["-dopt", "3"],
+    )
+
+    # an exact value_map key containing a comma wins over list splitting
+    import sailify.nvcc_hgcc_options as optmod
+    optmod.NVCC_HGCC_OPTIONS["--ptxas-options"]["value_map"]["-v,-w"] = "--resource-usage"
+    optmod._OPTION_LOOKUP = None
+    try:
+        expect(
+            "exact whole-value beats splitting",
+            translate_nvcc_options(["-Xptxas=-v,-w"]),
+            ["--llvm-options", "--resource-usage"],
+        )
+    finally:
+        del optmod.NVCC_HGCC_OPTIONS["--ptxas-options"]["value_map"]["-v,-w"]
+        optmod._OPTION_LOOKUP = None
+
+    # direct mappings
+    expect(
+        "direct mappings",
+        translate_nvcc_options(["--cubin", "--expt-extended-lambda"]),
+        ["-hgbin", "--extended-lambda", "-D__CUDACC_EXTENDED_LAMBDA__"],
+    )
+    expect(
+        "allow-unsupported-compiler",
+        translate_nvcc_options(["--allow-unsupported-compiler"]),
+        ["-Xpreprocess", "-D__NV_NO_HOST_COMPILER_CHECK=1"],
+    )
     return failures
 
 
@@ -635,7 +919,7 @@ def main(argv):
             ("sdk23_compat_shims", lambda: test_sdk23_compat_shims(tmp)),
             ("sdk22_state_resolved_with_compat_disabled", lambda: test_sdk22_state_resolved_with_compat_disabled(tmp)),
             ("versioned_runtime_api_conversion", lambda: test_versioned_runtime_api_conversion(tmp)),
-            ("nvcc_flag_mapping", test_nvcc_flag_mapping),
+            ("nvcc_flag_mapping", lambda: test_nvcc_flag_mapping(tmp)),
         ]:
             try:
                 failures = fn()

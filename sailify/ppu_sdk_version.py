@@ -11,6 +11,7 @@ import re
 import shutil
 import logging
 import subprocess
+from functools import lru_cache
 
 __all__ = [
     "DEFAULT_RUNTIME_API_VERSION",
@@ -31,9 +32,6 @@ _RUNTIME_API_RE = re.compile(r"Runtime API version\s+v\s*(\d+)", re.IGNORECASE)
 _HGGCRT_VERSION_RE = re.compile(r"hggcrt_version\s*[:=]\s*v?(\d+)", re.IGNORECASE)
 
 DEFAULT_RUNTIME_API_VERSION = 3
-
-_hgcc_version_cache = None
-_hgcc_version_queried = False
 
 
 def parse_version_string(version_str):
@@ -86,24 +84,27 @@ def _find_hgcc():
     return None
 
 
-def _query_hgcc_version():
-    global _hgcc_version_cache, _hgcc_version_queried
-    if _hgcc_version_queried:
-        return _hgcc_version_cache
-    _hgcc_version_queried = True
-    hgcc = _find_hgcc()
-    if not hgcc:
-        return None
+def _query_hgcc_version(hgcc):
+    """Share version output only while the compiler's file identity is unchanged."""
     try:
-        proc = subprocess.run(
-            [hgcc, "--version"], capture_output=True, text=True, timeout=30
+        real_hgcc = os.path.realpath(hgcc)
+        stat = os.stat(real_hgcc)
+        fingerprint = (
+            stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        return _query_hgcc_version_cached(hgcc, real_hgcc, fingerprint)
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
         log.warning("Failed to run %s --version: %s", hgcc, exc)
-        _hgcc_version_cache = None
         return None
-    _hgcc_version_cache = (proc.stdout or "", proc.stderr or "")
-    return _hgcc_version_cache
+
+
+@lru_cache(maxsize=8)
+def _query_hgcc_version_cached(hgcc, real_hgcc, fingerprint):
+    # Keep failures out of the cache and preserve symlink/wrapper invocation semantics.
+    proc = subprocess.run(
+        [hgcc, "--version"], capture_output=True, text=True, timeout=30, check=True
+    )
+    return proc.stdout or "", proc.stderr or ""
 
 
 def detect_ppu_sdk_version():
@@ -118,7 +119,7 @@ def detect_ppu_sdk_version():
             _SDK_ENV_VARS[0],
         )
         return None
-    output = _query_hgcc_version()
+    output = _query_hgcc_version(os.path.abspath(hgcc))
     if output is None:
         return None
     stdout, stderr = output
@@ -156,7 +157,8 @@ def _runtime_api_version_from_version_txt():
 
 
 def detect_runtime_api_version():
-    output = _query_hgcc_version()
+    hgcc = _find_hgcc()
+    output = _query_hgcc_version(os.path.abspath(hgcc)) if hgcc else None
     if output is not None:
         stdout, _stderr = output
         m = _RUNTIME_API_RE.search(stdout)

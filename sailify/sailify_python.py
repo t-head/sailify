@@ -19,12 +19,14 @@ import json
 import shutil
 import logging
 import fnmatch
+from contextvars import ContextVar
 from enum import Enum
 from typing import Iterable, Iterator, Optional, Dict, List
 
 from .cuda_to_ppu_mappings import (
     CUDA_TO_PPU_MAPPINGS,
     PPU_SDK_2_2_IDENTIFIER_MAP,
+    PPU_SDK_2_2_2_IDENTIFIER_MAP,
     PPU_SDK_2_3_RENAME_MAP,
 )
 from .unsupported_stubs import write_stubs_header
@@ -449,6 +451,23 @@ def _maybe_enable_sdk_2_2_mappings(ppu_sdk_version) -> None:
         _SDK22_RE = None
 
 
+# ── SDK-version-conditional mappings (PPU SDK >= 2.2.2) ───────────────
+
+_SDK_2_2_2_VERSION_INT = 20202
+
+_SDK222_RE = re.compile(
+    r"(?<!\w)(" + "|".join(map(re.escape, PPU_SDK_2_2_2_IDENTIFIER_MAP)) + r")(?!\w)"
+)
+_SDK222_MAPPINGS = ContextVar("sdk222_mappings", default=({}, None))
+
+
+def _maybe_enable_sdk_2_2_2_mappings(ppu_sdk_version) -> None:
+    if ppu_sdk_version is not None and version_to_int(ppu_sdk_version) >= _SDK_2_2_2_VERSION_INT:
+        _SDK222_MAPPINGS.set((PPU_SDK_2_2_2_IDENTIFIER_MAP, _SDK222_RE))
+    else:
+        _SDK222_MAPPINGS.set(({}, None))
+
+
 # ── SDK-version-conditional renames (PPU_SDK 2v3) ─────────────────────
 
 _SDK_2_3_VERSION_INT = 20300  # version_to_int((2, 3, 0))
@@ -466,6 +485,7 @@ def _maybe_enable_sdk_2_3_mappings(ppu_sdk_version) -> None:
 
 def _maybe_enable_sdk_version_mappings(ppu_sdk_version) -> None:
     _maybe_enable_sdk_2_2_mappings(ppu_sdk_version)
+    _maybe_enable_sdk_2_2_2_mappings(ppu_sdk_version)
     _maybe_enable_sdk_2_3_mappings(ppu_sdk_version)
 
 
@@ -624,64 +644,69 @@ def get_ppu_file_path(rel_filepath: str) -> str:
     return rel_filepath
 
 
-def _mask_comments_and_strings(source: str) -> str:
+_LINE_SPLICE_RE = re.compile(r"\\\r?\n")
+_COMMENT_START_RE = re.compile(r"/(?:\\\r?\n)*([/*])")
+_PP_SPACE = r"(?:[ \t\f\v]|\\\r?\n|/(?:\\\r?\n)*\*(?:[^*]|\*(?!(?:\\\r?\n)*/))*\*(?:\\\r?\n)*/)*"
+_INCLUDE_HEADER_RE = re.compile(
+    "#" + _PP_SPACE + r"(?:\\\r?\n)*".join("include") + _PP_SPACE
+    + r'(?P<header>"(?:[^"\r\n]|\\\r?\n)*"|<(?:[^>\r\n]|\\\r?\n)*>)'
+)
+_PP_NUMBER_RE = re.compile(
+    r"(?:[0-9]|\.(?:\\\r?\n)*[0-9])"
+    r"(?:(?:\\\r?\n)*(?:[eEpP](?:\\\r?\n)*[+-]|[a-zA-Z_0-9.]|'(?:\\\r?\n)*[a-zA-Z_0-9]))*"
+)
+
+
+def _mask_comments_and_strings(source: str, mask_includes: bool = False) -> str:
     """Mask comments and char literals with 'x' to gate identifier replacement."""
     n = len(source)
-    in_include = [False] * n
-    line_start = 0
-    while line_start < n:
-        line_end = source.find('\n', line_start)
-        if line_end == -1:
-            line_end = n
-        stripped_start = line_start
-        while stripped_start < line_end and source[stripped_start] in ' \t':
-            stripped_start += 1
-        if source[stripped_start:stripped_start + 8] == '#include':
-            rest = source[stripped_start + 8:line_end]
-            q1 = rest.find('"')
-            if q1 != -1:
-                q2 = rest.find('"', q1 + 1)
-                if q2 != -1:
-                    abs_q1 = stripped_start + 8 + q1
-                    abs_q2 = stripped_start + 8 + q2
-                    for j in range(abs_q1, abs_q2 + 1):
-                        in_include[j] = True
-        line_start = line_end + 1
-
-    def _count_trailing_backslashes(pos: int) -> int:
-        count = 0
-        j = pos - 1
-        while j >= 0 and source[j] == '\\':
-            count += 1
-            j -= 1
-        return count
-
+    include_start = include_end = -1
+    at_line_start = True
     in_context = ''
     result: List[str] = []
     i = 0
     while i < n:
         c = source[i]
 
-        if in_include[i]:
-            result.append(c)
-            i += 1
+        if i == include_start:
+            header = source[i:include_end]
+            result.extend('x' * len(header) if mask_includes else header)
+            i = include_end
+            at_line_start = False
             continue
 
+        if c == '\\' and not in_context.startswith('raw:'):
+            splice = _LINE_SPLICE_RE.match(source, i)
+            if splice:
+                text = splice.group()
+                result.extend('x' * len(text) if in_context in ('//', '/*', "'") else text)
+                i = splice.end()
+                continue
+
         if in_context == '':
-            if c == '/' and i + 1 < n:
-                if source[i + 1] == '/':
-                    in_context = '//'
-                    result.append('x')
-                    i += 1
-                    result.append('x')
-                    i += 1
+            if c == '/':
+                comment = _COMMENT_START_RE.match(source, i)
+                if comment:
+                    in_context = '/' + comment.group(1)
+                    comment_star = False
+                    result.extend('x' * (comment.end() - i))
+                    i = comment.end()
                     continue
-                elif source[i + 1] == '*':
-                    in_context = '/*'
-                    result.append('x')
-                    i += 1
-                    result.append('x')
-                    i += 1
+            if c in '\r\n':
+                at_line_start = True
+            elif c not in ' \t\f\v':
+                if c == '#' and at_line_start:
+                    directive = _INCLUDE_HEADER_RE.match(source, i)
+                    if directive:
+                        include_start, include_end = directive.span('header')
+                at_line_start = False
+            if (c in '0123456789' or c == '.') and (
+                i == 0 or not (source[i - 1].isalnum() or source[i - 1] == '_')
+            ):
+                number = _PP_NUMBER_RE.match(source, i)
+                if number:
+                    result.extend(number.group())
+                    i = number.end()
                     continue
             if c == 'R' and i + 1 < n and source[i + 1] == '"':
                 prefix_len = 0
@@ -733,41 +758,39 @@ def _mask_comments_and_strings(source: str) -> str:
         elif in_context == '//':
             if c == '\n' or c == '\r':
                 in_context = ''
+                at_line_start = True
                 result.append(c)
             else:
                 result.append('x')
             i += 1
 
         elif in_context == '/*':
-            if c == '/' and i > 0 and source[i - 1] == '*':
+            if c == '/' and comment_star:
                 in_context = ''
+            comment_star = c == '*'
             result.append('x')
             i += 1
 
-        elif in_context == '"':
+        elif in_context in ('"', "'"):
+            is_char = in_context == "'"
             if c == '\\':
-                result.append(c)
+                result.append('x' if is_char else c)
                 i += 1
+                # Line splices disappear before escape sequences are interpreted.
+                while i < n:
+                    splice = _LINE_SPLICE_RE.match(source, i)
+                    if splice is None:
+                        break
+                    text = splice.group()
+                    result.extend('x' * len(text) if is_char else text)
+                    i = splice.end()
                 if i < n:
-                    result.append(source[i])
+                    result.append('x' if is_char else source[i])
                     i += 1
                 continue
-            if c == '"':
+            if c == in_context:
                 in_context = ''
-            result.append(c)
-            i += 1
-
-        elif in_context == "'":
-            if c == '\\':
-                result.append('x')
-                i += 1
-                if i < n:
-                    result.append('x')
-                    i += 1
-                continue
-            if c == "'":
-                in_context = ''
-            result.append('x')
+            result.append('x' if is_char else c)
             i += 1
 
         elif in_context.startswith('raw:'):
@@ -854,6 +877,9 @@ def _ppu_repl(match):
     return _PPU_MAP.get(word, word)
 
 
+_AUTO_PPU_SDK_VERSION = object()
+
+
 def preprocessor(
     output_directory: str,
     filepath: str,
@@ -866,6 +892,7 @@ def preprocessor(
     inject_compat_include: bool = False,
     inject_compat_include_ignores: Iterable[str] = (),
     compat_include_line: str = COMPAT_WRAPPER_INCLUDE_LINE,
+    ppu_sdk_version=_AUTO_PPU_SDK_VERSION,
 ) -> SailifyResult:
     """Process a single CUDA source file and write the PPU equivalent.
 
@@ -875,6 +902,11 @@ def preprocessor(
     *inject_compat_include_ignores* — glob patterns (relative to
     *project_directory*) of headers to exempt from the injection.
     """
+    # An omitted version auto-detects; an explicit None preserves an unknown SDK.
+    if ppu_sdk_version is _AUTO_PPU_SDK_VERSION:
+        ppu_sdk_version = detect_ppu_sdk_version()
+    _maybe_enable_sdk_version_mappings(ppu_sdk_version)
+
     if project_directory:
         rel = os.path.relpath(filepath, project_directory)
     else:
@@ -923,17 +955,20 @@ def preprocessor(
     _new_parts.append(output_source[_last_end:])
     output_source = "".join(_new_parts)
 
-    # 2b. Apply the SDK >= 2.2 identifier group (enabled when the detected
-    # SDK version is 2.2+)
-    if _SDK22_MAP and _SDK22_RE is not None:
-        _masked22 = _mask_comments_and_strings(output_source)
+    # 2b. Apply SDK-version-conditional identifier groups.
+    for _sdk_map, _sdk_re in ((_SDK22_MAP, _SDK22_RE), _SDK222_MAPPINGS.get()):
+        if not _sdk_map or _sdk_re is None:
+            continue
+        if not _sdk_re.search(output_source):
+            continue
+        _masked_sdk = _mask_comments_and_strings(output_source, mask_includes=True)
         _new_parts = []
         _last_end = 0
-        for _m in _SDK22_RE.finditer(output_source):
-            if _masked22[_m.start()] == 'x':
+        for _m in _sdk_re.finditer(output_source):
+            if _masked_sdk[_m.start()] == 'x':
                 continue
             _new_parts.append(output_source[_last_end:_m.start()])
-            _new_parts.append(_SDK22_MAP.get(_m.group(1), _m.group(1)))
+            _new_parts.append(_sdk_map.get(_m.group(1), _m.group(1)))
             _last_end = _m.end()
         _new_parts.append(output_source[_last_end:])
         output_source = "".join(_new_parts)
@@ -1150,6 +1185,7 @@ def sailify(
                 inject_compat_include=inject_compat_include,
                 inject_compat_include_ignores=inject_compat_include_ignores or [],
                 compat_include_line=include_line,
+                ppu_sdk_version=ppu_sdk_version,
             )
             results[os.path.abspath(filepath)] = res
 
@@ -1191,7 +1227,8 @@ def sailify_extra_files(
     a dict mapping absolute input path -> SailifyResult.
     """
     output_directory = os.path.abspath(output_directory)
-    _maybe_enable_sdk_version_mappings(detect_ppu_sdk_version())
+    ppu_sdk_version = detect_ppu_sdk_version()
+    _maybe_enable_sdk_version_mappings(ppu_sdk_version)
     if install_ppu_compat:
         _ensure_ppu_compat(output_directory, stub_probe=stub_probe)
     stats: Dict[str, list] = {}
@@ -1209,6 +1246,7 @@ def sailify_extra_files(
             project_directory=output_directory,
             inject_compat_include=inject_compat_include,
             inject_compat_include_ignores=inject_compat_include_ignores or [],
+            ppu_sdk_version=ppu_sdk_version,
         )
         results[filepath] = res
 
@@ -1301,7 +1339,8 @@ def sailify_extra_files_recursive(
         Dict mapping absolute input path -> SailifyResult.
     """
     output_directory = os.path.abspath(output_directory)
-    _maybe_enable_sdk_version_mappings(detect_ppu_sdk_version())
+    ppu_sdk_version = detect_ppu_sdk_version()
+    _maybe_enable_sdk_version_mappings(ppu_sdk_version)
     if install_ppu_compat:
         _ensure_ppu_compat(output_directory, stub_probe=stub_probe)
     _header_include_dirs = header_include_dirs or []
@@ -1339,6 +1378,7 @@ def sailify_extra_files_recursive(
             backup=backup,
             inject_compat_include=inject_compat_include,
             inject_compat_include_ignores=inject_compat_include_ignores or [],
+            ppu_sdk_version=ppu_sdk_version,
         )
         results[filepath] = res
         processed_count += 1

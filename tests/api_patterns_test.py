@@ -420,7 +420,7 @@ def test_sdk23_renames_toggles_with_version():
             if got != expected:
                 failures.append("SDK 2.3 rename %r -> %r, expected %r" % (src, got, expected))
 
-        for version in ((2, 2, 9), (2, 2, 0), (2, 1, 5), None):
+        for version in ((2, 2, 9), (2, 2, 2), (2, 2, 1), (2, 2, 0), (2, 1, 5), None):
             sp._maybe_enable_sdk_version_mappings(version)
             if sp._SDK23_RENAME_ACTIVE:
                 failures.append("SDK 2.3 renames not disabled for version %r" % (version,))
@@ -433,6 +433,349 @@ def test_sdk23_renames_toggles_with_version():
         sp._maybe_enable_sdk_version_mappings((2, 3, 1))
         if not sp._SDK23_RENAME_ACTIVE:
             failures.append("SDK 2.3 renames not enabled for version (2, 3, 1)")
+    finally:
+        sp._maybe_enable_sdk_version_mappings(None)
+    return failures
+
+
+def test_sdk222_device_function_mapping(tmp):
+    import sailify.sailify_python as sp
+
+    cases = [
+        ("float e = __nv_erff(x);", "float e = __hg_erff(x);"),
+        ("float c = __nv_erfcf(x);", "float c = __hg_erfcf(x);"),
+        ("float i = __nv_erfcinvf(y);", "float i = __hg_erfcinvf(y);"),
+        ("float c = __nv_erfcxf(x);", "float c = __hg_erfcxf(x);"),
+        ("float i = __nv_erfinvf(y);", "float i = __hg_erfinvf(y);"),
+        ("double e = __nv_erf(x);", "double e = __hg_erf(x);"),
+        ("double c = __nv_erfc(x);", "double c = __hg_erfc(x);"),
+        ("double i = __nv_erfcinv(y);", "double i = __hg_erfcinv(y);"),
+        ("double c = __nv_erfcx(x);", "double c = __hg_erfcx(x);"),
+        ("double i = __nv_erfinv(y);", "double i = __hg_erfinv(y);"),
+        ("__nv_erff(x) + __nv_erf(y)", "__hg_erff(x) + __hg_erf(y)"),
+        ('const char* code = "__nv_erff(x)";', 'const char* code = "__hg_erff(x)";'),
+    ]
+    untouched = "\n".join([
+        '#include "__nv_erff.h"',
+        '# include "detail/__nv_erfcinv.h"',
+        '#include <__nv_erfinvf.h>',
+        '#include "__NV_THREAD_SCOPE_SYSTEM.h"',
+        "// __nv_erff(x)",
+        "/* __nv_erfc(x) */",
+        "int my__nv_erff_var = 0;",
+        "__nv_erfcinvf_suffix(x);",
+        "prefix__nv_erfinv(x);",
+        "float e = erff(x);",
+        "double e = erf(x);",
+        "float e = __hg_erff(x);",
+        "float s = __nv_sqrtf(x);",
+        "float f = __nv_fmaf(x, y, z);",
+    ]) + "\n"
+    source = "\n".join(src for src, _ in cases) + "\n" + untouched
+    converted = "\n".join(dst for _, dst in cases) + "\n" + untouched
+    versions = [
+        ((2, 2, 2), True),
+        ((2, 2, 1), False),
+        ((2, 2, 3), True),
+        (None, False),
+        ((2, 2, 99), True),
+        ((2, 2, 0), False),
+        ((2, 3, 0), True),
+        ((2, 1, 5), False),
+        ((2, 3, 1), True),
+        ((2, 4, 0), True),
+        ((3, 0, 0), True),
+    ]
+    src_dir = os.path.join(tmp, "sdk222_device_functions")
+    os.makedirs(src_dir, exist_ok=True)
+    src = os.path.join(src_dir, "error_functions.cu")
+    failures = []
+    orig_detect = sp.detect_ppu_sdk_version
+    try:
+        for entry in ("project", "extra_files"):
+            for version, enabled in versions:
+                sp.detect_ppu_sdk_version = lambda: version
+                with open(src, "w") as fh:
+                    fh.write(source)
+                expected = converted if enabled else source
+                for iteration in range(2):
+                    if entry == "project":
+                        results = sp.sailify(
+                            src_dir, ppu_sdk_version=version, install_ppu_compat=False,
+                        )
+                    else:
+                        results = sp.sailify_extra_files(
+                            src_dir, [src], install_ppu_compat=False,
+                        )
+                    with open(src) as fh:
+                        got = fh.read()
+                    if src not in results or results[src].status != "ok" or got != expected:
+                        failures.append(
+                            "%s SDK %r iteration %d: expected %r, got %r"
+                            % (entry, version, iteration, expected, got)
+                        )
+    finally:
+        sp.detect_ppu_sdk_version = orig_detect
+        sp._maybe_enable_sdk_version_mappings(None)
+    return failures
+
+
+def test_sdk222_lexical_boundaries(tmp):
+    import sailify.sailify_python as sp
+
+    call = "float e = __nv_erff(x);\n"
+    mapped = call.replace("__nv_erff", "__hg_erff")
+    cases = []
+    for directive in (
+        '#include /* libdevice */ "__nv_erff.h"',
+        '#include /*\n*/ "__nv_erff.h"',
+        '/*\n*/ #include "__nv_erff.h"',
+        '#include /\\\n* SDK *\\\n/ "__nv_erff.h"',
+        '# /* before */ include /* after */ <__nv_erff.h>',
+        '/* leading */ #include "__nv_erff.h"',
+        '#include \\\n "__nv_erff.h"',
+        '#\\\ninc\\\nlude /* path */ \\\n <__nv_erff.h>',
+        '#include "detail/\\\n__nv_erff.h"',
+        '#include "detail//__nv_erff.h"',
+        '#include "detail/1\'000/__nv_erff.h"',
+    ):
+        cases.append((directive + "\n" + call, directive + "\n" + mapped))
+    for newline in ("\n", "\r\n"):
+        for backslashes in ("\\", "\\\\"):
+            comment = "// continued " + backslashes + newline + "__nv_erff(x)" + newline
+            cases.append((comment + call, comment + mapped))
+    for number in (
+        "1'000", "0xDEAD'BEEF", "0b10'01", "1.2'5e+1'0", ".1'25", "1'000_km",
+        "1\\\n'000", "1'\\\n000", ".\\\n1'25", "1.2e\\\n+1'0",
+    ):
+        declaration = "auto n = " + number + ";\n"
+        cases.append((declaration + call, declaration + mapped))
+    for literal in ("'" + "\\" * 2 + "\n''", "'" + "\\" * 2 + "\n'__nv_erff'"):
+        declaration = "int c = " + literal + ";\n"
+        cases.append((declaration + call, declaration + mapped))
+    cases.extend([
+        ('/\\\n/ __nv_erff(x)\n' + call, '/\\\n/ __nv_erff(x)\n' + mapped),
+        ('/\\\n* __nv_erff(x) *\\\n/\n' + call, '/\\\n* __nv_erff(x) *\\\n/\n' + mapped),
+        ('#define H <stddef.h>\n#include /**/ H\n// /**/ "cudaMalloc"\n' + call,
+         '#define H <stddef.h>\n#include /**/ H\n// /**/ "cudaMalloc"\n' + mapped),
+        ('#define H <stddef.h>\n#include /**/ H\nconst char* s = /**/ "__nv_erff(x)";\n',
+         '#define H <stddef.h>\n#include /**/ H\nconst char* s = /**/ "__hg_erff(x)";\n'),
+        ('#define CODE /*\n*/ #include "__nv_erff.h"\n',
+         '#define CODE /*\n*/ #include "__hg_erff.h"\n'),
+        ('const char* s = "' + "\\" * 2 + '\n"__nv_erff";\n' + call,
+         'const char* s = "' + "\\" * 2 + '\n"__hg_erff";\n' + mapped),
+        ("char c = 'x'; char d = '\\''; auto u = u8'a';\n" + call,
+         "char c = 'x'; char d = '\\''; auto u = u8'a';\n" + mapped),
+        ('const char* code = "__nv_erff(x)";\n',
+         'const char* code = "__hg_erff(x)";\n'),
+        ('const char* code = R"src(\n#include "__nv_erff.h"\n__nv_erff(x)\n)src";\n',
+         'const char* code = R"src(\n#include "__hg_erff.h"\n__hg_erff(x)\n)src";\n'),
+        ("int n = 1'000; cudaMalloc(&p, n);\n" + call,
+         "int n = 1'000; hggcMalloc(&p, n);\n" + mapped),
+    ])
+    root = os.path.join(tmp, "lexical")
+    os.makedirs(root, exist_ok=True)
+    src = os.path.join(root, "kernel.cu")
+    failures = []
+    try:
+        for index, (source, expected) in enumerate(cases):
+            with open(src, "w", newline="") as fh:
+                fh.write(source)
+            results = sp.sailify(root, ppu_sdk_version=(2, 2, 2), install_ppu_compat=False)
+            with open(src) as fh:
+                actual = fh.read()
+            if results[src].status != "ok" or actual != expected.replace("\r\n", "\n"):
+                failures.append("lexical case %d: %r" % (index, actual))
+            masked = sp._mask_comments_and_strings(source, mask_includes=True)
+            if len(masked) != len(source):
+                failures.append("mask length differs in case %d" % index)
+    finally:
+        sp._maybe_enable_sdk_version_mappings(None)
+    return failures
+
+
+def test_sdk222_concurrent_conversion(tmp):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from unittest.mock import patch
+    import sailify.sailify_python as sp
+
+    barrier = Barrier(2)
+    preprocessor = sp.preprocessor
+    source = "float e = __nv_erff(x);\n"
+
+    def process(**kwargs):
+        barrier.wait(timeout=10)
+        return preprocessor(**kwargs)
+
+    def convert(version):
+        root = os.path.join(tmp, "concurrent", str(version))
+        os.makedirs(root, exist_ok=True)
+        src = os.path.join(root, "kernel.cu")
+        with open(src, "w") as fh:
+            fh.write(source)
+        results = sp.sailify(root, ppu_sdk_version=version, install_ppu_compat=False)
+        with open(src) as fh:
+            return results[src].status, fh.read()
+
+    with patch.object(sp, "preprocessor", side_effect=process):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            actual = list(pool.map(convert, [(2, 2, 2), (2, 2, 1)]))
+    expected = [("ok", source.replace("__nv_", "__hg_")), ("ok", source)]
+    return [] if actual == expected else ["concurrent SDK selection: %r" % (actual,)]
+
+
+def test_sdk222_detected_compiler_switch(tmp):
+    from unittest.mock import patch
+    import sailify.sailify_python as sp
+
+    source = "float e = __nv_erff(x);\n"
+    roots = []
+    for version in ("2.2.2", "2.2.1"):
+        root = os.path.join(tmp, "detector", version)
+        os.makedirs(os.path.join(root, "bin"), exist_ok=True)
+        compiler = os.path.join(root, "bin", "hgcc")
+        with open(compiler, "w") as fh:
+            fh.write("#!" + sys.executable + "\nprint('Release version " + version + "')\n")
+        os.chmod(compiler, 0o755)
+        roots.append(root)
+
+    src = os.path.join(tmp, "detected.cu")
+    failures = []
+    try:
+        for entry in ("direct", "extra_files", "recursive"):
+            for env_var in ("PATH", "PPU_SDK"):
+                for index in (0, 1, 0):
+                    env = {"PATH": "", "PPU_SDK": "", "PPU_HOME": ""}
+                    env[env_var] = os.path.join(roots[index], "bin") if env_var == "PATH" else roots[index]
+                    with patch.dict(os.environ, env):
+                        with open(src, "w") as fh:
+                            fh.write(source)
+                        if entry == "direct":
+                            result = sp.preprocessor(
+                                output_directory=tmp, filepath=src, all_files=[src],
+                                stats={}, clean_ctx=None, show_progress=False,
+                                project_directory=tmp,
+                            )
+                        elif entry == "recursive":
+                            result = sp.sailify_extra_files_recursive(
+                                tmp, [src], install_ppu_compat=False,
+                            )[src]
+                        else:
+                            result = sp.sailify_extra_files(tmp, [src], install_ppu_compat=False)[src]
+                        with open(src) as fh:
+                            actual = fh.read()
+                    expected = source.replace("__nv_", "__hg_") if index == 0 else source
+                    if result.status != "ok" or actual != expected:
+                        failures.append("%s compiler switch via %s to %s: %r" % (entry, env_var, roots[index], actual))
+    finally:
+        sp._maybe_enable_sdk_version_mappings(None)
+    return failures
+
+
+def test_sdk222_explicit_entry_version(tmp):
+    from unittest.mock import patch
+    import sailify.sailify_python as sp
+
+    root = os.path.join(tmp, "explicit_sdk")
+    os.makedirs(root, exist_ok=True)
+    src = os.path.join(root, "kernel.cu")
+    source = "float e = __nv_erff(x);\n"
+    failures = []
+    try:
+        for entry in ("direct", "project"):
+            for selected, detected in (((2, 2, 2), (2, 2, 1)), ((2, 2, 1), (2, 2, 2)), (None, None)):
+                with open(src, "w") as fh:
+                    fh.write(source)
+                with patch.object(sp, "detect_ppu_sdk_version", return_value=detected) as detect:
+                    if entry == "direct":
+                        sp.preprocessor(
+                            output_directory=root, filepath=src, all_files=[src],
+                            stats={}, clean_ctx=None, show_progress=False,
+                            project_directory=root, ppu_sdk_version=selected,
+                        )
+                    else:
+                        sp.sailify(root, ppu_sdk_version=selected, install_ppu_compat=False)
+                    expected_calls = int(entry == "project" and selected is None)
+                    if detect.call_count != expected_calls:
+                        failures.append("%s re-detected explicit SDK %r" % (entry, selected))
+                with open(src) as fh:
+                    actual = fh.read()
+                expected = source.replace("__nv_", "__hg_") if selected == (2, 2, 2) else source
+                if actual != expected:
+                    failures.append("%s explicit SDK %r: %r" % (entry, selected, actual))
+    finally:
+        sp._maybe_enable_sdk_version_mappings(None)
+    return failures
+
+
+def test_sdk222_compiler_identity(tmp):
+    from unittest.mock import patch
+    import sailify.ppu_sdk_version as sv
+    import sailify.sailify_python as sp
+
+    root = os.path.join(tmp, "compiler_identity")
+    os.makedirs(root, exist_ok=True)
+    calls_path = os.path.join(root, "calls.txt")
+    src = os.path.join(root, "kernel.cu")
+    source = "float e = __nv_erff(x);\n"
+    failures = []
+
+    def write_compiler(path, sdk, runtime):
+        content = (
+            "#!" + sys.executable + "\nimport sys\n"
+            + "with open(" + repr(calls_path) + ", 'a') as fh:\n    fh.write(sys.argv[0] + '\\n')\n"
+            + "print('Release version " + sdk + "')\n"
+            + "print('Runtime API version v" + str(runtime) + "')\n"
+        )
+        with open(path, "w") as fh:
+            fh.write(content)
+        os.chmod(path, 0o755)
+
+    def calls():
+        with open(calls_path) as fh:
+            return fh.read().splitlines()
+
+    compilers = []
+    for sdk, runtime in (("2.2.2", 3), ("2.2.1", 2)):
+        path = os.path.join(root, "hgcc-" + sdk)
+        write_compiler(path, sdk, runtime)
+        compilers.append(path)
+
+    try:
+        for mode in ("symlink", "inplace"):
+            home = os.path.join(root, mode)
+            os.makedirs(os.path.join(home, "bin"), exist_ok=True)
+            path = os.path.join(home, "bin", "hgcc")
+            for index in (0, 1, 0):
+                sdk = (2, 2, 2) if index == 0 else (2, 2, 1)
+                runtime = 3 if index == 0 else 2
+                if mode == "symlink":
+                    if os.path.islink(path):
+                        os.unlink(path)
+                    os.symlink(compilers[index], path)
+                else:
+                    previous = os.stat(path) if os.path.exists(path) else None
+                    write_compiler(path, ".".join(map(str, sdk)), runtime)
+                    if previous is not None:
+                        os.utime(path, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+                env = {"PATH": "", "PPU_SDK": home, "PPU_HOME": ""}
+                with patch.dict(os.environ, env):
+                    actual_sdk = sv.detect_ppu_sdk_version()
+                    first_calls = calls()
+                    actual_runtime = sv.detect_runtime_api_version()
+                    with open(src, "w") as fh:
+                        fh.write(source)
+                    result = sp.sailify_extra_files(root, [src], install_ppu_compat=False)[src]
+                    with open(src) as fh:
+                        actual = fh.read()
+                expected = source.replace("__nv_", "__hg_") if index == 0 else source
+                if (actual_sdk, actual_runtime, result.status, actual) != (sdk, runtime, "ok", expected):
+                    failures.append("%s compiler change: %r" % (mode, (actual_sdk, actual_runtime, actual)))
+                if calls() != first_calls:
+                    failures.append("%s unchanged compiler missed cache" % mode)
+                if first_calls[-1] != path:
+                    failures.append("%s invoked resolved path instead of original path" % mode)
     finally:
         sp._maybe_enable_sdk_version_mappings(None)
     return failures
@@ -458,7 +801,7 @@ def test_sdk23_compat_shims(tmp):
         if "#ifndef" in content or "#define PPU" in content:
             failures.append("shim %s contains a guard" % name)
 
-    for idx, version in enumerate(((2, 2, 0), (2, 1, 5), None)):
+    for idx, version in enumerate(((2, 2, 2), (2, 2, 1), (2, 2, 0), (2, 1, 5), None)):
         compat = os.path.join(tmp, "shims", str(idx))
         sp.write_compat_wrapper_header(compat, ppu_sdk_version=version)
         for name, _ in sp._SDK23_SHIM_HEADERS:
@@ -916,6 +1259,12 @@ def main(argv):
             ("sglang_aot_preprocessor_direct", lambda: test_sglang_aot_preprocessor_direct(tmp)),
             ("sdk22_mapping_state_toggles_with_version", test_sdk22_mapping_state_toggles_with_version),
             ("sdk23_renames_toggles_with_version", test_sdk23_renames_toggles_with_version),
+            ("sdk222_device_function_mapping", lambda: test_sdk222_device_function_mapping(tmp)),
+            ("sdk222_lexical_boundaries", lambda: test_sdk222_lexical_boundaries(tmp)),
+            ("sdk222_concurrent_conversion", lambda: test_sdk222_concurrent_conversion(tmp)),
+            ("sdk222_detected_compiler_switch", lambda: test_sdk222_detected_compiler_switch(tmp)),
+            ("sdk222_explicit_entry_version", lambda: test_sdk222_explicit_entry_version(tmp)),
+            ("sdk222_compiler_identity", lambda: test_sdk222_compiler_identity(tmp)),
             ("sdk23_compat_shims", lambda: test_sdk23_compat_shims(tmp)),
             ("sdk22_state_resolved_with_compat_disabled", lambda: test_sdk22_state_resolved_with_compat_disabled(tmp)),
             ("versioned_runtime_api_conversion", lambda: test_versioned_runtime_api_conversion(tmp)),

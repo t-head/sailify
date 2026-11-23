@@ -2,8 +2,12 @@ import argparse
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "lib"))
@@ -52,6 +56,14 @@ def test_pytorch_codegen_string_conversion():
         "auto s = getStreamFromExternalMasqueradingAsCUDA();",
         "std::string msg = \"CUDA driver error: \";",
     ]
+    from sailify.cuda_to_ppu_mappings import PPU_SDK_VERSION_MAPPINGS
+
+    for kind, _, mapping in PPU_SDK_VERSION_MAPPINGS:
+        if kind == "identifier":
+            for src in mapping:
+                untouched.append(src + ";")
+                if rx.match(src + ";") is None or _PPU_MAP.get(src) != src:
+                    failures.append(src + " missing identity entry in codegen map/trie")
     for src in untouched:
         if sailify_str(src) != src:
             failures.append(src + " should stay untouched")
@@ -362,30 +374,189 @@ def test_sglang_aot_preprocessor_direct(tmp):
     return failures
 
 
-def test_sdk22_mapping_state_toggles_with_version():
+def test_sdk_version_mapping_registry():
+    import sailify.cuda_to_ppu_mappings as mappings
     import sailify.sailify_python as sp
 
     failures = []
-    try:
-        sp._maybe_enable_sdk_2_2_mappings((2, 2, 0))
-        if not sp._SDK22_MAP or sp._SDK22_RE is None:
-            failures.append("SDK 2.2 mappings not enabled for version (2, 2, 0)")
-        elif sp._SDK22_RE.search("__NV_THREAD_SCOPE_THREAD") is None:
-            failures.append("SDK 2.2 regex does not match a mapped identifier")
+    groups = (
+        ("identifier", (2, 2, 0), mappings.PPU_SDK_2_2_IDENTIFIER_MAP),
+        ("identifier", (2, 2, 2), mappings.PPU_SDK_2_2_2_IDENTIFIER_MAP),
+        ("include", (2, 3, 0), mappings.PPU_SDK_2_3_RENAME_MAP),
+    )
+    if mappings.PPU_SDK_VERSION_MAPPINGS != groups:
+        failures.append("SDK registry must contain the three versioned mapping groups")
+    snapshots = [dict(mapping) for _, _, mapping in groups]
+    with patch.object(sp, "detect_ppu_sdk_version", return_value=(2, 3, 0)) as detect:
+        for version in _SDK_VERSIONS + _SDK_SWITCH_VERSIONS:
+            for kind in ("identifier", "include"):
+                expected = {}
+                for group_kind, minimum, mapping in groups:
+                    if kind == group_kind and version is not None and version >= minimum:
+                        expected.update(mapping)
+                got = sp._get_versioned_mappings(kind, version)
+                if got != expected:
+                    failures.append("registry %s version=%r: %r != %r" %
+                                    (kind, version, got, expected))
+        if detect.called:
+            failures.append("mapping resolver called version detector")
+    if snapshots != [dict(mapping) for _, _, mapping in groups]:
+        failures.append("mapping resolution mutated registry data")
+    return failures
 
-        sp._maybe_enable_sdk_2_2_mappings((2, 1, 5))
-        if sp._SDK22_MAP or sp._SDK22_RE is not None:
-            failures.append("SDK 2.2 mappings not reset for version (2, 1, 5)")
 
-        sp._maybe_enable_sdk_2_2_mappings((2, 2, 0))
-        if not sp._SDK22_MAP or sp._SDK22_RE is None:
-            failures.append("SDK 2.2 mappings not re-enabled after reset")
+_SDK222_ERF_MAP = {
+    "__nv_" + name: "__hg_" + name
+    for name in ("erf", "erff", "erfc", "erfcf", "erfinv", "erfinvf",
+                 "erfcinv", "erfcinvf", "erfcx", "erfcxf")
+}
+_SDK_VERSIONS = (None, (2, 1, 5), (2, 2, 0), (2, 2, 1),
+                 (2, 2, 2), (2, 2, 3), (2, 3, 0))
+_SDK_SWITCH_VERSIONS = ((2, 3, 0), (2, 1, 5), None, (2, 3, 0))
+_SDK_VERSIONED_SOURCE = (
+    '#include <vector_types.h>\n#include_next "sub/vector_types.h"\n'
+    '__NV_THREAD_SCOPE_SYSTEM; __nv_erff(x); __nv_atomic_add(p, 1, 0, 0);\n'
+)
 
-        sp._maybe_enable_sdk_2_2_mappings(None)
-        if sp._SDK22_MAP or sp._SDK22_RE is not None:
-            failures.append("SDK 2.2 mappings not reset for unknown version")
-    finally:
-        sp._maybe_enable_sdk_2_2_mappings(None)
+
+def _sdk_version_expected(version):
+    expected = _SDK_VERSIONED_SOURCE.replace("__nv_atomic_add", "__hg_atomic_add")
+    if version is not None and version >= (2, 2, 0):
+        expected = expected.replace("__NV_THREAD_SCOPE_SYSTEM", "__HG_THREAD_SCOPE_SYSTEM")
+    if version is not None and version >= (2, 2, 2):
+        expected = expected.replace("__nv_erff", "__hg_erff")
+    if version is not None and version >= (2, 3, 0):
+        expected = expected.replace("vector_types.h", "hggc_vector_types.h")
+    return expected
+
+
+def _sdk222_convert(sp, tmp, source, **version):
+    path = os.path.join(tmp, "sdk222_direct.cu")
+    with open(path, "w") as fh:
+        fh.write(source)
+    result = sp.preprocessor(
+        output_directory=tmp, filepath=path, all_files=[], stats={},
+        clean_ctx=None, show_progress=False, project_directory=tmp, **version,
+    )
+    if result.status != "ok":
+        raise RuntimeError("SDK 2.2.2 preprocessor status: " + str(result.status))
+    with open(result.ppuified_path) as fh:
+        return fh.read()
+
+
+def test_sdk222_erf_direct(tmp):
+    from sailify.cuda_to_ppu_mappings import PPU_SDK_2_2_2_IDENTIFIER_MAP
+    import sailify.sailify_python as sp
+
+    failures = []
+    if dict(PPU_SDK_2_2_2_IDENTIFIER_MAP) != _SDK222_ERF_MAP:
+        failures.append("SDK 2.2.2 erf mapping must contain exactly the ten names")
+    calls = " ".join(name + "(x);" for name in _SDK222_ERF_MAP) + "\n"
+    untouched = " ".join("prefix" + n + " " + n + "_suffix " + n + "2"
+                         for n in (*_SDK222_ERF_MAP, "__NV_THREAD_SCOPE_SYSTEM")) + "\n"
+    untouched += "__nv_sqrtf(x); __nv_fmaf(x, y, z); "
+    untouched += " ".join(n[5:] + "(x);" for n in _SDK222_ERF_MAP) + "\n"
+    source = _SDK_VERSIONED_SOURCE + calls + untouched
+    options_list = [{"ppu_sdk_version": v} for v in _SDK_VERSIONS + _SDK_SWITCH_VERSIONS]
+    # Omission after an enabled conversion must also leave every conditional group off.
+    for options in options_list + [{}]:
+        version = options.get("ppu_sdk_version")
+        enabled = version is not None and version >= (2, 2, 2)
+        expected = _sdk_version_expected(version)
+        expected += (calls.replace("__nv_", "__hg_") if enabled else calls) + untouched
+        with patch.object(sp, "detect_ppu_sdk_version", return_value=(2, 3, 0)) as detect:
+            got = _sdk222_convert(sp, tmp, source, **options)
+            again = _sdk222_convert(sp, tmp, got, **options)
+        label = "options=%r" % options
+        if got != expected or again != got:
+            failures.append(label + ": versioned names/includes/boundaries/idempotence mismatch")
+        if detect.called:
+            failures.append(label + ": direct preprocessor called version detector")
+    return failures
+
+
+def test_conditional_identifier_include_mask(tmp):
+    from sailify.cuda_to_ppu_mappings import PPU_SDK_2_2_IDENTIFIER_MAP
+    import sailify.sailify_python as sp
+
+    protected = (
+        '#include "__nv_erf.h"\n#include <__nv_erff.h>\n'
+        '#include_next "__nv_erfc.h"\n#include_next <__nv_erfcf.h>\n'
+        ' \t# include "__nv_erfinv.h"\n'
+        '# include_next <__nv_erfinvf.h>\n'
+        '#include"detail/__nv_erfcinv.h"\n'
+        '#include_next<detail/__nv_erfcinvf.h>\n'
+        '#include "detail//__nv_erfcx.h"\n'
+        '#include <detail/__nv_erfcxf.h>\n'
+        "'__nv_erff'; '\\''; // __nv_erfc(x)\n/* __nv_erfinv(x) */\n"
+    )
+    mapped = (
+        'const char* normal = "__nv_erff(x)";\n'
+        'const char* raw = R"tag(\n#include "__nv_erfcf.h"\n__nv_erfcf(x))tag";\n'
+        '#define APPLY(x) \\\n (__nv_erfinvf(x) + cudaMalloc(&p, n))\n'
+        '__nv_erf(x);\n'
+    )
+    for name in PPU_SDK_2_2_IDENTIFIER_MAP:
+        protected += '#include "%s.h"\n# include_next<detail/%s.h>\n' % (name, name)
+    protected += "'__NV_THREAD_SCOPE_THREAD'; // __NV_THREAD_SCOPE_BLOCK\n"
+    protected += "/* __NV_THREAD_SCOPE_CLUSTER */\n"
+    mapped += 'const char* scope = "__NV_THREAD_SCOPE_SYSTEM";\n'
+    mapped += '#define SCOPE __NV_THREAD_SCOPE_DEVICE\n'
+    failures = []
+    for version in _SDK_VERSIONS:
+        expected = mapped.replace("cudaMalloc", "hggcMalloc")
+        if version is not None and version >= (2, 2, 0):
+            expected = expected.replace("__NV_THREAD_SCOPE_", "__HG_THREAD_SCOPE_")
+        if version is not None and version >= (2, 2, 2):
+            expected = expected.replace("__nv_", "__hg_")
+        got = _sdk222_convert(sp, tmp, protected + mapped, ppu_sdk_version=version)
+        if got != protected + expected:
+            failures.append("SDK %r: conditional include/comment/char shielding or string/macro mapping mismatch" %
+                            (version,))
+    return failures
+
+
+def test_sdk222_erf_entry_points(tmp):
+    import sailify.sailify_python as sp
+
+    failures = []
+    calls = " ".join(n + "(x);" for n in _SDK222_ERF_MAP) + "\n"
+    body = _SDK_VERSIONED_SOURCE + calls
+    for route in ("project", "extra_files", "recursive", "explicit_project"):
+        for idx, version in enumerate(_SDK_VERSIONS):
+            root = os.path.join(tmp, "sdk222_%s_%d" % (route, idx))
+            os.makedirs(root, exist_ok=True)
+            kernel, header = [os.path.join(root, n) for n in ("kernel.cu", "detail.cuh")]
+            sources = {kernel: '#include "detail.cuh"\n' + body, header: body}
+            for path, text in sources.items():
+                with open(path, "w") as fh:
+                    fh.write(text)
+            enabled = version is not None and version >= (2, 2, 2)
+            explicit = route == "explicit_project" and version is not None
+            detected = ((2, 1, 5) if enabled else (2, 3, 0)) if explicit else version
+            with patch.object(sp, "detect_ppu_sdk_version", return_value=detected) as detect:
+                if route in ("project", "explicit_project"):
+                    options = {"ppu_sdk_version": version} if route == "explicit_project" else {}
+                    results = sp.sailify(root, install_ppu_compat=False, **options)
+                elif route == "extra_files":
+                    results = sp.sailify_extra_files(root, [kernel, header], install_ppu_compat=False)
+                else:
+                    results = sp.sailify_extra_files_recursive(root, [kernel], install_ppu_compat=False)
+            if detect.called == explicit:
+                failures.append("%s version=%r: detection did not respect explicit/default version" %
+                                (route, version))
+            expected_body = _sdk_version_expected(version)
+            expected_body += calls.replace("__nv_", "__hg_") if enabled else calls
+            for path, text in sources.items():
+                label = "%s version=%r %s" % (route, version, os.path.basename(path))
+                if path not in results or results[path].status != "ok":
+                    failures.append(label + ": missing/failed conversion (including header closure)")
+                    continue
+                with open(results[path].ppuified_path) as fh:
+                    got = fh.read()
+                expected = text.replace(body, expected_body)
+                if got != expected:
+                    failures.append(label + ": selected SDK version not respected")
     return failures
 
 
@@ -404,37 +575,214 @@ _SDK23_RENAME_CASES = [
     ("#include<vector_types.h>", "#include<hggc_vector_types.h>"),
     ('#include"host_defines.h"', '#include"hggc_host_defines.h"'),
     ("# include <vector_types.h>", "# include <hggc_vector_types.h>"),
+    ("#include_next <vector_types.h>", "#include_next <hggc_vector_types.h>"),
+    ('#include_next "cuda_runtime.h"', '#include_next "hggc_runtime.h"'),
 ]
 
 
-def test_sdk23_renames_toggles_with_version():
+def test_sdk23_include_version_matrix():
     import sailify.sailify_python as sp
 
     failures = []
-    try:
-        sp._maybe_enable_sdk_version_mappings((2, 3, 0))
-        if not sp._SDK23_RENAME_ACTIVE:
-            failures.append("SDK 2.3 renames not enabled for version (2, 3, 0)")
-        for src, expected in _SDK23_RENAME_CASES:
-            got = sp._rewrite_include_directives(src)
+    versions = _SDK_VERSIONS + ((2, 2, 9), (2, 3, 1)) + _SDK_SWITCH_VERSIONS
+    with patch.object(sp, "detect_ppu_sdk_version", return_value=(2, 3, 0)) as detect:
+        for version in versions:
+            for src, renamed in _SDK23_RENAME_CASES:
+                expected = (renamed if version is not None and version >= (2, 3, 0)
+                            else src.replace("cuda_runtime.h", "hggc_runtime.h"))
+                got = sp._rewrite_include_directives(src, ppu_sdk_version=version)
+                if got != expected:
+                    failures.append("SDK %r include %r -> %r, expected %r" %
+                                    (version, src, got, expected))
+        for src, _ in _SDK23_RENAME_CASES:
+            if sp._rewrite_include_directives(src) != src.replace("cuda_runtime.h", "hggc_runtime.h"):
+                failures.append("omitted SDK version activated conditional include rename: " + src)
+        if detect.called:
+            failures.append("include rewrite helper called version detector")
+    return failures
+
+
+def test_include_next_conversion(tmp):
+    import sailify.sailify_python as sp
+
+    source = (
+        '#include_next <cuda_runtime.h>\n'
+        '# include_next "cuda_runtime.h"\n'
+        '#include_next<vector_types.h>\n'
+        '# include_next "sub/vector_types.h"\n'
+        '#include_next "__nv_erff.h"\n'
+    )
+    failures = []
+    for version in _SDK_VERSIONS + _SDK_SWITCH_VERSIONS:
+        expected = source.replace("cuda_runtime.h", "hggc_runtime.h")
+        if version is not None and version >= (2, 3, 0):
+            expected = expected.replace("vector_types.h", "hggc_vector_types.h")
+        rewritten = sp._rewrite_include_directives(source, ppu_sdk_version=version)
+        converted = _sdk222_convert(sp, tmp, source, ppu_sdk_version=version)
+        if rewritten != expected or converted != expected:
+            failures.append("include_next SDK %r: rewrite=%r converted=%r" %
+                            (version, rewritten, converted))
+    return failures
+
+
+def test_include_comment_splice_operands(tmp):
+    from sailify.cuda_to_ppu_mappings import PPU_SDK_2_2_IDENTIFIER_MAP
+    import sailify.sailify_python as sp
+
+    # Keep the operand separate so only a *mapped* header may lose its splices.
+    cases = []
+    for directive in ("include", "include_next"):
+        for opening, closing in (('"', '"'), ('<', '>')):
+            prefix = ' /* lead */ #/* hash */' + directive + '/* operand */' + opening
+            suffix = closing + ' /* trailing __nv_erff */\n'
+            for header in ("__nv_erff.h", "detail/vector_types.h", "cuda_runtime.h"):
+                cases.append((prefix, header, suffix))
+            for name in PPU_SDK_2_2_IDENTIFIER_MAP:
+                cases.append((prefix, "detail/" + name + ".h", suffix))
+            for newline in ("\n", "\r\n"):
+                splice = "\\" + newline
+                prefix = ('\t#' + splice + ' /* hash */inc' + splice +
+                          directive[3:] + ' /* before' + newline +
+                          ' operand */' + splice + opening)
+                suffix = closing + ' /* after */' + splice + newline
+                for header in ("detail/__nv_erff." + splice + "h",
+                               "detail/__nv_" + splice + "erff.h",
+                               "__NV_THREAD_SCOPE_SYSTEM." + splice + "h",
+                               "sub/vector_" + splice + "types.h",
+                               "cuda_run" + splice + "time.h"):
+                    cases.append((prefix, header, suffix))
+                    probe = ('#if __has_inc' + splice + directive[3:] +
+                             ' /* name */ (' + splice + ' /* operand */' + opening)
+                    cases.append((probe, header, closing + ' /* close */)' + newline +
+                                  '#endif' + newline))
+
+    failures = []
+    for version in (None, (2, 2, 1), (2, 2, 2), (2, 3, 0)):
+        separated = ('/* first */\n#include "__nv_erff.h"\n#include <cuda_runtime.h>\n'
+                     '/* second */ #include_next <cuda_runtime.h>\n')
+        expected = separated.replace("cuda_runtime.h", "hggc_runtime.h")
+        for got in (sp._rewrite_include_directives(separated, ppu_sdk_version=version),
+                    _sdk222_convert(sp, tmp, separated, ppu_sdk_version=version)):
             if got != expected:
-                failures.append("SDK 2.3 rename %r -> %r, expected %r" % (src, got, expected))
+                failures.append("SDK %r: block comment swallowed a directive: %r" % (version, got))
+        for prefix, header, suffix in cases:
+            logical = re.sub(r"\\\r?\n", "", header)
+            expected_header = logical.replace("cuda_runtime.h", "hggc_runtime.h")
+            if version is not None and version >= (2, 3, 0):
+                expected_header = expected_header.replace("vector_types.h", "hggc_vector_types.h")
+            mapped = expected_header != logical
+            if not mapped:
+                expected_header = header
+            source = prefix + header + suffix
+            for route in ("rewrite", "preprocessor"):
+                if route == "rewrite":
+                    convert = lambda text: sp._rewrite_include_directives(text, ppu_sdk_version=version)
+                    before, after, operand = prefix, suffix, expected_header
+                else:
+                    convert = lambda text: _sdk222_convert(sp, tmp, text, ppu_sdk_version=version)
+                    # Existing file I/O normalizes CRLF; the helper above checks exact bytes.
+                    before, after, operand = (s.replace("\r\n", "\n")
+                                               for s in (prefix, suffix, expected_header))
+                got = convert(source)
+                label = "%s SDK %r source=%r" % (route, version, source)
+                if not got.startswith(before) or not got.endswith(after):
+                    failures.append(label + ": changed directive/comments/delimiters: " + repr(got))
+                else:
+                    actual_header = got[len(before):len(got) - len(after)]
+                    if mapped:
+                        actual_header = re.sub(r"\\\r?\n", "", actual_header)
+                    if actual_header != operand:
+                        failures.append(label + ": header %r != %r" % (actual_header, operand))
+                if convert(got) != got:
+                    failures.append(label + ": not idempotent")
+    return failures
 
-        for version in ((2, 2, 9), (2, 2, 0), (2, 1, 5), None):
-            sp._maybe_enable_sdk_version_mappings(version)
-            if sp._SDK23_RENAME_ACTIVE:
-                failures.append("SDK 2.3 renames not disabled for version %r" % (version,))
-            for src, expected in _SDK23_RENAME_CASES[:9]:
-                got = sp._rewrite_include_directives(src)
-                if "hggc_" in got:
-                    failures.append("legacy include rewritten for version %r: %r -> %r" % (version, src, got))
-                    break
 
-        sp._maybe_enable_sdk_version_mappings((2, 3, 1))
-        if not sp._SDK23_RENAME_ACTIVE:
-            failures.append("SDK 2.3 renames not enabled for version (2, 3, 1)")
-    finally:
-        sp._maybe_enable_sdk_version_mappings(None)
+def test_has_include_literal_operands(tmp):
+    from sailify.cuda_to_ppu_mappings import PPU_SDK_2_2_IDENTIFIER_MAP
+    import sailify.sailify_python as sp
+
+    headers = (
+        '#if __has_include("vector_types.h") && __has_include_next(<sub/vector_types.h>)\n'
+        '#include "vector_types.h"\n#include_next <sub/vector_types.h>\n'
+        '#elif __has_include(<cuda_runtime.h>) || __has_include_next("cuda_runtime.h")\n'
+        '#include <cuda_runtime.h>\n#include_next "cuda_runtime.h"\n#endif\n'
+        '#define HAVE_VECTOR __has_include /* name */ ( /* open */ "sub/vector_types.h" /* close */ )\n'
+        '#define HAVE_RUNTIME __has_include_next/* name */(/* open */<cuda_runtime.h>/* close */)\n'
+    )
+    protected = (
+        '#define HEADER_NAME <vector_types.h>\n'
+        '#if __has_include(HEADER_NAME) || __has_include_next(HEADER_NAME)\n'
+        '#include HEADER_NAME\n#endif\n'
+        '#if __has_include /* first */ (HEADER_NAME) // __has_include /* second */ (<cuda_runtime.h>)\n'
+        '#endif\n'
+        '#if my__has_include("vector_types.h") || __has_include_extra(<vector_types.h>)\n'
+        '#elif my__has_include_next(<vector_types.h>) || __has_include_next_extra("vector_types.h")\n'
+        '#endif\n'
+        '// __has_include(<cuda_runtime.h>) __has_include_next("vector_types.h")\n'
+        '/*\n#if __has_include("vector_types.h") || __has_include_next(<cuda_runtime.h>)\n#endif\n*/\n'
+        "'__has_include(<cuda_runtime.h>)'; '__has_include_next(<__nv_erff.h>)';\n"
+    )
+    for name in ("__nv_erff", *PPU_SDK_2_2_IDENTIFIER_MAP):
+        protected += (
+            '#if __has_include("%s.h") || __has_include_next(<detail/%s.h>)\n'
+            '#elif __has_include(<%s.h>) || __has_include_next("detail/%s.h")\n'
+            '#endif\n#define HAVE_USER_%s __has_include("%s.h")\n'
+        ) % (name, name, name, name, name, name)
+    for newline in ("\n", "\r\n"):
+        splice = "\\" + newline
+        headers += ('#if __has_in' + splice + 'clude /* name */ (' + splice +
+                    ' <vector_types.h> /* close */) || __has_include_' + splice +
+                    'next/* name */("cuda_runtime.h")' + newline + '#endif' + newline)
+        protected += ('#define HAVE_SPLICED __has_in' + splice + 'clude_next /* name */ (' +
+                      splice + ' /* open */ <detail/__nv_erff.' + splice + 'h>)' + newline)
+    mapped = (
+        '__nv_erff(x); __NV_THREAD_SCOPE_SYSTEM; cudaMalloc(&p, n);\n'
+        'my__has_include("__nv_erff.h"); __has_include_extra(<__nv_erff.h>);\n'
+        'my__has_include_next("__nv_erff.h"); __has_include_next_extra(<__nv_erff.h>);\n'
+        'const char* normal = "__has_include(<__nv_erff.h>) __nv_erff(x) cudaMalloc(&p, n)";\n'
+        'const char* include_text = "#include <__nv_erff.h> __NV_THREAD_SCOPE_SYSTEM";\n'
+        'const char* raw = R"tag(\n#include "__nv_erff.h"\n'
+        '#include_next <__NV_THREAD_SCOPE_SYSTEM.h>\n'
+        '#if __has_include("__nv_erff.h") || __has_include_next(<__NV_THREAD_SCOPE_SYSTEM.h>)\n'
+        '__nv_erff(x); cudaMalloc(&p, n);\n#endif\n)tag";\n'
+    )
+    strings = (
+        'const char* probe_text = "__has_include(<vector_types.h>)";\n'
+        'const char* raw_headers = R"tag(\n#if __has_include_next(<vector_types.h>)\n'
+        '#include_next <vector_types.h>\n#endif\n)tag";\n'
+    )
+    source = headers + protected + mapped + strings
+    failures = []
+
+    def check(label, got, expected):
+        if got != expected:
+            offset = next((i for i, (a, b) in enumerate(zip(got, expected)) if a != b),
+                          min(len(got), len(expected)))
+            failures.append("%s at %d: %r != %r" %
+                            (label, offset, got[offset:offset + 100], expected[offset:offset + 100]))
+
+    for version in (None, (2, 2, 1), (2, 2, 2), (2, 3, 0)):
+        expected_headers = headers.replace("cuda_runtime.h", "hggc_runtime.h")
+        expected_strings = strings
+        if version is not None and version >= (2, 3, 0):
+            expected_headers = expected_headers.replace("vector_types.h", "hggc_vector_types.h")
+            expected_strings = strings.replace("vector_types.h", "hggc_vector_types.h")
+        rewritten = sp._rewrite_include_directives(source, ppu_sdk_version=version)
+        expected = expected_headers + protected + mapped + expected_strings
+        check("SDK %r: literal probe/include rewrite" % (version,), rewritten, expected)
+        if sp._rewrite_include_directives(rewritten, ppu_sdk_version=version) != rewritten:
+            failures.append("SDK %r: probe rewrite not idempotent" % (version,))
+        expected_mapped = mapped.replace("cudaMalloc", "hggcMalloc")
+        if version is not None and version >= (2, 2, 0):
+            expected_mapped = expected_mapped.replace("__NV_THREAD_SCOPE_", "__HG_THREAD_SCOPE_")
+        if version is not None and version >= (2, 2, 2):
+            expected_mapped = expected_mapped.replace("__nv_erff", "__hg_erff")
+        expected = (expected_headers + protected + expected_mapped + expected_strings).replace("\r\n", "\n")
+        got = _sdk222_convert(sp, tmp, source, ppu_sdk_version=version)
+        check("SDK %r: probe shielding/API/string/raw conversion" % (version,), got, expected)
+        if _sdk222_convert(sp, tmp, got, ppu_sdk_version=version) != got:
+            failures.append("SDK %r: probe conversion not idempotent" % (version,))
     return failures
 
 
@@ -458,7 +806,7 @@ def test_sdk23_compat_shims(tmp):
         if "#ifndef" in content or "#define PPU" in content:
             failures.append("shim %s contains a guard" % name)
 
-    for idx, version in enumerate(((2, 2, 0), (2, 1, 5), None)):
+    for idx, version in enumerate(((2, 2, 2), (2, 2, 1), (2, 2, 0), (2, 1, 5), None)):
         compat = os.path.join(tmp, "shims", str(idx))
         sp.write_compat_wrapper_header(compat, ppu_sdk_version=version)
         for name, _ in sp._SDK23_SHIM_HEADERS:
@@ -467,48 +815,110 @@ def test_sdk23_compat_shims(tmp):
     return failures
 
 
-def test_sdk22_state_resolved_with_compat_disabled(tmp):
+def test_sdk_versions_with_compat_disabled(tmp):
     import sailify.sailify_python as sp
 
     src_dir = os.path.join(tmp, "compat_off")
     os.makedirs(src_dir, exist_ok=True)
     src = os.path.join(src_dir, "k.cu")
-
-    def write_case():
-        with open(src, "w") as fh:
-            fh.write(
-                "int run(int* p) { __nv_atomic_add(p, 1, 0, "
-                "__NV_THREAD_SCOPE_SYSTEM); return 0; }\n"
-            )
-
     failures = []
-    orig_detect = sp.detect_ppu_sdk_version
-    try:
-        sp.detect_ppu_sdk_version = lambda: (2, 1, 5)
-        sp._maybe_enable_sdk_2_2_mappings((2, 2, 0))
-        write_case()
-        sp.sailify_extra_files(src_dir, [src], install_ppu_compat=False)
-        with open(src) as fh:
+    for version in _SDK_SWITCH_VERSIONS:
+        with open(src, "w") as fh:
+            fh.write(_SDK_VERSIONED_SOURCE)
+        with patch.object(sp, "detect_ppu_sdk_version", return_value=version):
+            results = sp.sailify_extra_files(src_dir, [src], install_ppu_compat=False)
+        with open(results[src].ppuified_path) as fh:
             text = fh.read()
-        if "__hg_atomic_add" not in text:
-            failures.append("__nv_atomic_add mapping is not unconditional")
-        if "__HG_THREAD_SCOPE_SYSTEM" in text:
-            failures.append("stale SDK 2.2 state leaked into sailify_extra_files")
-
-        sp._maybe_enable_sdk_2_2_mappings(None)
-        sp.detect_ppu_sdk_version = lambda: (2, 2, 0)
-        write_case()
-        sp.sailify_extra_files(src_dir, [src], install_ppu_compat=False)
-        with open(src) as fh:
-            text = fh.read()
-        if "__hg_atomic_add" not in text:
-            failures.append("__nv_atomic_add mapping is not unconditional")
-        if "__NV_THREAD_SCOPE_SYSTEM" in text or "__HG_THREAD_SCOPE_SYSTEM" not in text:
-            failures.append("sailify_extra_files did not apply SDK 2.2 mappings")
-    finally:
-        sp.detect_ppu_sdk_version = orig_detect
-        sp._maybe_enable_sdk_2_2_mappings(None)
+        if results[src].status != "ok" or text != _sdk_version_expected(version):
+            failures.append("compat-disabled conversion ignored SDK %r" % (version,))
+        with patch.object(sp, "detect_ppu_sdk_version", return_value=(2, 3, 0)) as detect:
+            direct = _sdk222_convert(sp, tmp, _SDK_VERSIONED_SOURCE)
+        if direct != _sdk_version_expected(None) or detect.called:
+            failures.append("direct conversion inherited high-level SDK %r or detected a version" %
+                            (version,))
+    if os.path.exists(os.path.join(src_dir, ".ppu_compat")):
+        failures.append("install_ppu_compat=False still generated compatibility headers")
     return failures
+
+
+def test_sdk_direct_concurrent_versions(tmp):
+    import sailify.sailify_python as sp
+
+    # Exercise per-call SDK isolation only; other project-wide state is out of scope.
+    versions = ((2, 3, 0), (2, 2, 2), (2, 1, 5))
+    roots = [os.path.join(tmp, "sdk_concurrent_%d" % i) for i in range(len(versions))]
+    for root in roots:
+        os.makedirs(root, exist_ok=True)
+    barrier = Barrier(len(versions), timeout=10)
+    preprocessor = sp.preprocessor
+
+    def synchronized_preprocessor(*args, **kwargs):
+        barrier.wait()
+        return preprocessor(*args, **kwargs)
+
+    def convert(item):
+        root, version = item
+        return [_sdk222_convert(sp, root, _SDK_VERSIONED_SOURCE, ppu_sdk_version=version)
+                for _ in range(3)]
+
+    with patch.object(sp, "preprocessor", new=synchronized_preprocessor), \
+            patch.object(sp, "detect_ppu_sdk_version", side_effect=AssertionError("direct detection")):
+        with ThreadPoolExecutor(max_workers=len(versions)) as pool:
+            outputs = list(pool.map(convert, zip(roots, versions)))
+    return ["concurrent direct conversion leaked SDK selection for %r" % (version,)
+            for version, texts in zip(versions, outputs)
+            if texts != [_sdk_version_expected(version)] * 3]
+
+
+def test_sdk_future_registry_groups(tmp):
+    # Mock only registry data before sailify_python builds its map/trie at import.
+    code = r'''
+import os
+import re
+import sys
+from unittest.mock import patch
+sys.path.insert(0, sys.argv[1])
+import sailify.cuda_to_ppu_mappings as mappings
+mappings.PPU_SDK_VERSION_MAPPINGS += (
+    ("identifier", (9, 0, 0), {"__nv_future_probe": "__hg_future_probe"}),
+    ("include", (9, 0, 0), {"future_probe.h": "hg_future_probe.h"}),
+)
+import sailify.sailify_python as sp
+rx = re.compile(rf"({sp._PPU_TRIE.export_to_regex()})(?=\W)")
+assert rx.match("__nv_future_probe();")
+assert rx.sub(lambda m: sp._PPU_MAP[m.group(0)], "__nv_future_probe();") == "__nv_future_probe();"
+source = ('#include <future_probe.h>\n#include_next "sub/future_probe.h"\n'
+          '#include "__nv_future_probe.h"\n#include <vector_types.h>\n'
+          '__nv_future_probe(); __NV_THREAD_SCOPE_SYSTEM; __nv_erff(x);\n')
+path = os.path.join(sys.argv[2], "future_registry.cu")
+with patch.object(sp, "detect_ppu_sdk_version", side_effect=AssertionError("direct detection")):
+    for version in ((9, 0, 0), (2, 3, 0), None, (9, 0, 0)):
+        expected = source
+        if version is not None:
+            expected = expected.replace("vector_types.h", "hggc_vector_types.h")
+            expected = expected.replace("__NV_THREAD_SCOPE_SYSTEM", "__HG_THREAD_SCOPE_SYSTEM")
+            expected = expected.replace("__nv_erff", "__hg_erff")
+        if version == (9, 0, 0):
+            expected = expected.replace("<future_probe.h>", "<hg_future_probe.h>")
+            expected = expected.replace("sub/future_probe.h", "sub/hg_future_probe.h")
+            expected = expected.replace("__nv_future_probe()", "__hg_future_probe()")
+        with open(path, "w") as fh:
+            fh.write(source)
+        result = sp.preprocessor(
+            output_directory=sys.argv[2], filepath=path, all_files=[], stats={},
+            clean_ctx=None, show_progress=False, project_directory=sys.argv[2],
+            ppu_sdk_version=version,
+        )
+        assert result.status == "ok", result.status
+        with open(result.ppuified_path) as fh:
+            got = fh.read()
+        assert got == expected, (version, got, expected)
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", code, os.path.dirname(HERE), tmp],
+        capture_output=True, text=True, timeout=30,
+    )
+    return [] if result.returncode == 0 else ["future registry groups: " + result.stdout + result.stderr]
 
 
 _RT_VERSIONED_CASES = [
@@ -914,10 +1324,18 @@ def main(argv):
             ("pytorch_cpp_extension_jit", lambda: test_pytorch_cpp_extension_jit(tmp)),
             ("jit_rerun_inject_recursion", lambda: test_jit_rerun_inject_recursion(tmp)),
             ("sglang_aot_preprocessor_direct", lambda: test_sglang_aot_preprocessor_direct(tmp)),
-            ("sdk22_mapping_state_toggles_with_version", test_sdk22_mapping_state_toggles_with_version),
-            ("sdk23_renames_toggles_with_version", test_sdk23_renames_toggles_with_version),
+            ("sdk_version_mapping_registry", test_sdk_version_mapping_registry),
+            ("sdk222_erf_direct", lambda: test_sdk222_erf_direct(tmp)),
+            ("conditional_identifier_include_mask", lambda: test_conditional_identifier_include_mask(tmp)),
+            ("sdk222_erf_entry_points", lambda: test_sdk222_erf_entry_points(tmp)),
+            ("sdk23_include_version_matrix", test_sdk23_include_version_matrix),
+            ("include_next_conversion", lambda: test_include_next_conversion(tmp)),
+            ("include_comment_splice_operands", lambda: test_include_comment_splice_operands(tmp)),
+            ("has_include_literal_operands", lambda: test_has_include_literal_operands(tmp)),
             ("sdk23_compat_shims", lambda: test_sdk23_compat_shims(tmp)),
-            ("sdk22_state_resolved_with_compat_disabled", lambda: test_sdk22_state_resolved_with_compat_disabled(tmp)),
+            ("sdk_versions_with_compat_disabled", lambda: test_sdk_versions_with_compat_disabled(tmp)),
+            ("sdk_direct_concurrent_versions", lambda: test_sdk_direct_concurrent_versions(tmp)),
+            ("sdk_future_registry_groups", lambda: test_sdk_future_registry_groups(tmp)),
             ("versioned_runtime_api_conversion", lambda: test_versioned_runtime_api_conversion(tmp)),
             ("nvcc_flag_mapping", lambda: test_nvcc_flag_mapping(tmp)),
         ]:

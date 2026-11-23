@@ -22,6 +22,10 @@ jobs:
     timeout-minutes: 30
     outputs:
       artifact_name: tmp-wheel-${{ github.run_id }}-${{ github.run_attempt }}
+      repo: ${{ steps.source_metadata.outputs.repo }}
+      commit: ${{ steps.source_metadata.outputs.commit }}
+      branch: ${{ steps.source_metadata.outputs.branch }}
+      tag: ${{ steps.source_metadata.outputs.tag }}
     steps:
       - name: Check out caller code
         uses: actions/checkout@v4
@@ -30,6 +34,35 @@ jobs:
           fetch-depth: 0
           submodules: recursive
           persist-credentials: false
+
+      - name: Record actual build source metadata
+        id: source_metadata
+        shell: bash
+        env:
+          SOURCE_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          branch="$(git symbolic-ref --quiet --short HEAD || true)"
+          if [[ -z "$branch" ]]; then
+            # For detached HEAD, record a branch only when exactly one remote branch points to the commit.
+            # Do not infer the build branch from historical containment or the default branch.
+            branches=()
+            while IFS= read -r ref; do
+              [[ "$ref" == refs/remotes/origin/HEAD ]] && continue
+              branches+=("${ref#refs/remotes/origin/}")
+            done < <(git for-each-ref --points-at="$commit" --format='%(refname)' refs/remotes/origin/)
+            if [[ "${#branches[@]}" -eq 1 ]]; then
+              branch="${branches[0]}"
+            fi
+          fi
+          tag="$(git tag --points-at "$commit" | LC_ALL=C sort | paste -sd ',' -)"
+          {
+            printf 'repo=%s\n' "$SOURCE_REPO"
+            printf 'commit=%s\n' "$commit"
+            printf 'branch=%s\n' "$branch"
+            printf 'tag=%s\n' "$tag"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up Python for the build
         uses: actions/setup-python@v5
@@ -62,6 +95,10 @@ jobs:
     with:
       # Use the actual artifact name from the build job output so rerunning only the publish job does not select a different run_attempt.
       artifact_name: ${{ needs.build.outputs.artifact_name }}
+      repo: ${{ needs.build.outputs.repo }}
+      commit: ${{ needs.build.outputs.commit }}
+      branch: ${{ needs.build.outputs.branch }}
+      tag: ${{ needs.build.outputs.tag }}
       template_repository: t-head/ci-infra
       template_ref: main
     secrets:

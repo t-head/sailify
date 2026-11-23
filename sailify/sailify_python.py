@@ -19,13 +19,13 @@ import json
 import shutil
 import logging
 import fnmatch
+from bisect import bisect_right
 from enum import Enum
 from typing import Iterable, Iterator, Optional, Dict, List
 
 from .cuda_to_ppu_mappings import (
     CUDA_TO_PPU_MAPPINGS,
-    PPU_SDK_2_2_IDENTIFIER_MAP,
-    PPU_SDK_2_3_RENAME_MAP,
+    PPU_SDK_VERSION_MAPPINGS,
 )
 from .unsupported_stubs import write_stubs_header
 from .ppu_sdk_version import (
@@ -217,6 +217,8 @@ def _generate_compat_wrapper_header(version_config=None, ppu_sdk_version=None,
 
 # Static compat headers that ship alongside compatible_wrapper.h
 _COMPAT_STATIC_HEADERS = ["hgperf_common.h", "hgperf_host.h", "ppu_sdk_fixups.h", "mma.h", "hggc_fp4.h", "hggc_device_runtime_api.h"]
+
+_SDK_2_3_VERSION_INT = 20300
 
 _SDK23_SHIM_HEADERS = [
     ("hggc_channel_descriptor.h", "channel_descriptor.h"),
@@ -414,59 +416,25 @@ for _mapping in CUDA_TO_PPU_MAPPINGS:
         _PPU_TRIE.add(_src)
         _PPU_MAP[_src] = _dst
 
+for _kind, _min_version, _mapping in PPU_SDK_VERSION_MAPPINGS:
+    if _kind == "identifier":
+        for _src in _mapping:
+            _PPU_TRIE.add(_src)
+            # Base-map consumers have no SDK selection.
+            _PPU_MAP.setdefault(_src, _src)
+
 _RE_PPU_PREPROCESSOR = re.compile(
     r"(?<!\w)(" + _PPU_TRIE.export_to_regex() + r")(?!\w)"
 )
 
-# ── SDK-version-conditional mappings (PPU SDK >= 2.2) ─────────────────
 
-_SDK_2_2_VERSION_INT = 20200  # version_to_int((2, 2, 0))
-
-_SDK22_MAP: Dict[str, str] = {}
-_SDK22_RE: Optional[re.Pattern] = None
-
-
-def _enable_sdk_2_2_mappings() -> None:
-    """Activate the PPU SDK >= 2.2 identifier group (idempotent)."""
-    global _SDK22_MAP, _SDK22_RE
-    if _SDK22_RE is not None:
-        return
-    trie = Trie()
-    mapping = {}
-    for src, dst in PPU_SDK_2_2_IDENTIFIER_MAP.items():
-        trie.add(src)
-        mapping[src] = dst
-    _SDK22_MAP = mapping
-    _SDK22_RE = re.compile(r"(?<!\w)(" + trie.export_to_regex() + r")(?!\w)")
-
-
-def _maybe_enable_sdk_2_2_mappings(ppu_sdk_version) -> None:
-    global _SDK22_MAP, _SDK22_RE
-    if ppu_sdk_version is not None and version_to_int(ppu_sdk_version) >= _SDK_2_2_VERSION_INT:
-        _enable_sdk_2_2_mappings()
-    else:
-        _SDK22_MAP = {}
-        _SDK22_RE = None
-
-
-# ── SDK-version-conditional renames (PPU_SDK 2v3) ─────────────────────
-
-_SDK_2_3_VERSION_INT = 20300  # version_to_int((2, 3, 0))
-
-_SDK23_RENAME_ACTIVE = False
-
-
-def _maybe_enable_sdk_2_3_mappings(ppu_sdk_version) -> None:
-    global _SDK23_RENAME_ACTIVE
-    _SDK23_RENAME_ACTIVE = (
-        ppu_sdk_version is not None
-        and version_to_int(ppu_sdk_version) >= _SDK_2_3_VERSION_INT
-    )
-
-
-def _maybe_enable_sdk_version_mappings(ppu_sdk_version) -> None:
-    _maybe_enable_sdk_2_2_mappings(ppu_sdk_version)
-    _maybe_enable_sdk_2_3_mappings(ppu_sdk_version)
+def _get_versioned_mappings(kind, ppu_sdk_version):
+    version = version_to_int(ppu_sdk_version)
+    mappings = {}
+    for mapping_kind, min_version, mapping in PPU_SDK_VERSION_MAPPINGS:
+        if mapping_kind == kind and version >= version_to_int(min_version):
+            mappings.update(mapping)
+    return mappings
 
 
 # ── Custom mapping support ────────────────────────────────────────────
@@ -624,8 +592,11 @@ def get_ppu_file_path(rel_filepath: str) -> str:
     return rel_filepath
 
 
-def _mask_comments_and_strings(source: str) -> str:
+def _mask_comments_and_strings(source: str, mask_includes: bool = False) -> str:
     """Mask comments and char literals with 'x' to gate identifier replacement."""
+    include_ends = {
+        start: end for start, end, _path in _iter_header_names(source)
+    } if mask_includes else {}
     n = len(source)
     in_include = [False] * n
     line_start = 0
@@ -662,12 +633,17 @@ def _mask_comments_and_strings(source: str) -> str:
     while i < n:
         c = source[i]
 
-        if in_include[i]:
+        if in_include[i] and not mask_includes:
             result.append(c)
             i += 1
             continue
 
         if in_context == '':
+            if i in include_ends:
+                end = include_ends[i]
+                result.extend('x' * (end - i))
+                i = end
+                continue
             if c == '/' and i + 1 < n:
                 if source[i + 1] == '/':
                     in_context = '//'
@@ -799,26 +775,51 @@ _BARE_ONLY_INCLUDES = {
 }
 
 
-def _rewrite_include_directives(source: str) -> str:
-    """Apply CUDA_INCLUDE_MAP path replacements specifically in #include directives."""
+_RE_LINE_SPLICE = re.compile(r"\\\r?\n")
+_HEADER_SPACE = r"(?:[ \t\f\v]|/\*(?:[^*]|\*(?!/))*\*/)*"
+_RE_HEADER_NAME = re.compile(
+    rf"(?:^{_HEADER_SPACE}#{_HEADER_SPACE}include(?:_next)?{_HEADER_SPACE}"
+    rf"|(?P<probe>(?<!\w)__has_include(?:_next)?){_HEADER_SPACE}\({_HEADER_SPACE})"
+    r'(?P<header><[^>\r\n]+>|"[^"\r\n]+")'
+    rf"(?(probe)(?={_HEADER_SPACE}\)))",
+    re.MULTILINE,
+)
+
+
+def _iter_header_names(source: str):
+    splice_positions = []
+    splice_shifts = [0]
+
+    def _remove_splice(match):
+        splice_positions.append(match.start() - splice_shifts[-1])
+        splice_shifts.append(splice_shifts[-1] + len(match.group()))
+        return ""
+
+    logical_source = _RE_LINE_SPLICE.sub(_remove_splice, source)
+    probe_mask = None
+    for match in _RE_HEADER_NAME.finditer(logical_source):
+        if match.group("probe") is not None:
+            if probe_mask is None:
+                probe_mask = _mask_comments_and_strings(logical_source)
+            if probe_mask[match.start("probe")] == 'x':
+                continue
+        start, end = match.span("header")
+        # Include delimiters anchor the mask even when the filename starts with a splice.
+        source_start = start + splice_shifts[bisect_right(splice_positions, start)]
+        source_end = end + splice_shifts[bisect_right(splice_positions, end - 1)]
+        yield source_start, source_end, match.group("header")[1:-1]
+
+
+def _rewrite_include_directives(source: str, ppu_sdk_version=None) -> str:
+    """Rewrite header paths in include directives and header probes."""
     from .cuda_to_ppu_mappings import CUDA_INCLUDE_MAP
 
-    _inc_re = re.compile(
-        r'^([ \t]*#[ \t]*include[ \t]*[<"])([^>"]+)([>"])',
-        re.MULTILINE,
-    )
-
-    if _SDK23_RENAME_ACTIVE:
-        pairs = list(CUDA_INCLUDE_MAP.items()) + list(PPU_SDK_2_3_RENAME_MAP.items())
-    else:
-        pairs = CUDA_INCLUDE_MAP.items()
-    _sorted_pairs = sorted(pairs, key=lambda kv: -len(kv[0]))
-
-    def _replace(match):
-        prefix = match.group(1)
-        path = match.group(2)
-        suffix = match.group(3)
-
+    mapping = dict(CUDA_INCLUDE_MAP)
+    mapping.update(_get_versioned_mappings("include", ppu_sdk_version))
+    _sorted_pairs = sorted(mapping.items(), key=lambda kv: -len(kv[0]))
+    parts = []
+    last_end = 0
+    for start, end, path in _iter_header_names(source):
         new_path = path
 
         if '/' not in new_path and new_path in _BARE_ONLY_INCLUDES:
@@ -839,19 +840,22 @@ def _rewrite_include_directives(source: str) -> str:
                         new_path = new_path[:last_slash + 1] + ppu_path
                     else:
                         new_path = ppu_path
-        return prefix + new_path + suffix
-
-    return _inc_re.sub(_replace, source)
+        if new_path != path:
+            parts.append(source[last_end:start])
+            parts.append(source[start] + new_path + source[end - 1])
+            last_end = end
+    parts.append(source[last_end:])
+    return "".join(parts)
 
 
 # ── Preprocessor (per-file) ───────────────────────────────────────────
 
-def _ppu_repl(match):
+def _ppu_repl(match, identifier_map):
     """Regex replacement callback."""
     word = match.group(1)
     if word in _CUSTOM_SPECIAL_MAP:
         return _CUSTOM_SPECIAL_MAP[word]
-    return _PPU_MAP.get(word, word)
+    return identifier_map.get(word, _PPU_MAP.get(word, word))
 
 
 def preprocessor(
@@ -866,8 +870,11 @@ def preprocessor(
     inject_compat_include: bool = False,
     inject_compat_include_ignores: Iterable[str] = (),
     compat_include_line: str = COMPAT_WRAPPER_INCLUDE_LINE,
+    ppu_sdk_version=None,
 ) -> SailifyResult:
     """Process a single CUDA source file and write the PPU equivalent.
+
+    An omitted *ppu_sdk_version* disables version-conditional mappings.
 
     With *inject_compat_include*, header files (.h/.hpp/.cuh) additionally get
     the compat wrapper include (*compat_include_line*) prepended.
@@ -907,36 +914,28 @@ def preprocessor(
         )
 
     # 1b. Apply include-specific path rewrites BEFORE the trie step
-    output_source = _rewrite_include_directives(output_source)
+    output_source = _rewrite_include_directives(output_source, ppu_sdk_version)
 
     # 2. Apply main CUDA→PPU mappings via the pre-compiled trie regex
+    identifier_map = _get_versioned_mappings("identifier", ppu_sdk_version)
     _masked = _mask_comments_and_strings(output_source)
+    _masked_identifiers = None
 
     _new_parts = []
     _last_end = 0
     for _m in _RE_PPU_PREPROCESSOR.finditer(output_source):
-        if _masked[_m.start()] == 'x':
+        if _m.group(1) in identifier_map:
+            if _masked_identifiers is None:
+                _masked_identifiers = _mask_comments_and_strings(output_source, mask_includes=True)
+            if _masked_identifiers[_m.start()] == 'x':
+                continue
+        elif _masked[_m.start()] == 'x':
             continue
         _new_parts.append(output_source[_last_end:_m.start()])
-        _new_parts.append(_ppu_repl(_m))
+        _new_parts.append(_ppu_repl(_m, identifier_map))
         _last_end = _m.end()
     _new_parts.append(output_source[_last_end:])
     output_source = "".join(_new_parts)
-
-    # 2b. Apply the SDK >= 2.2 identifier group (enabled when the detected
-    # SDK version is 2.2+)
-    if _SDK22_MAP and _SDK22_RE is not None:
-        _masked22 = _mask_comments_and_strings(output_source)
-        _new_parts = []
-        _last_end = 0
-        for _m in _SDK22_RE.finditer(output_source):
-            if _masked22[_m.start()] == 'x':
-                continue
-            _new_parts.append(output_source[_last_end:_m.start()])
-            _new_parts.append(_SDK22_MAP.get(_m.group(1), _m.group(1)))
-            _last_end = _m.end()
-        _new_parts.append(output_source[_last_end:])
-        output_source = "".join(_new_parts)
 
     for _pat, _repl in _EXTRA_MAPPING_LISTS:
         output_source = output_source.replace(_pat, _repl)
@@ -1117,7 +1116,6 @@ def sailify(
 
         if ppu_sdk_version is None:
             ppu_sdk_version = detect_ppu_sdk_version()
-        _maybe_enable_sdk_version_mappings(ppu_sdk_version)
         if install_ppu_compat:
             runtime_api_version = detect_runtime_api_version()
             _print_detected_versions(ppu_sdk_version, runtime_api_version)
@@ -1150,6 +1148,7 @@ def sailify(
                 inject_compat_include=inject_compat_include,
                 inject_compat_include_ignores=inject_compat_include_ignores or [],
                 compat_include_line=include_line,
+                ppu_sdk_version=ppu_sdk_version,
             )
             results[os.path.abspath(filepath)] = res
 
@@ -1168,7 +1167,6 @@ def _ensure_ppu_compat(output_directory: str, stub_probe: bool = True) -> None:
     """(Re)generate .ppu_compat in output_directory with the detected PPU SDK version."""
     compat_dir = os.path.join(output_directory, ".ppu_compat")
     ppu_sdk_version = detect_ppu_sdk_version()
-    _maybe_enable_sdk_version_mappings(ppu_sdk_version)
     runtime_api_version = detect_runtime_api_version()
     _print_detected_versions(ppu_sdk_version, runtime_api_version)
     write_compat_wrapper_header(compat_dir, ppu_sdk_version=ppu_sdk_version,
@@ -1191,7 +1189,7 @@ def sailify_extra_files(
     a dict mapping absolute input path -> SailifyResult.
     """
     output_directory = os.path.abspath(output_directory)
-    _maybe_enable_sdk_version_mappings(detect_ppu_sdk_version())
+    ppu_sdk_version = detect_ppu_sdk_version()
     if install_ppu_compat:
         _ensure_ppu_compat(output_directory, stub_probe=stub_probe)
     stats: Dict[str, list] = {}
@@ -1209,6 +1207,7 @@ def sailify_extra_files(
             project_directory=output_directory,
             inject_compat_include=inject_compat_include,
             inject_compat_include_ignores=inject_compat_include_ignores or [],
+            ppu_sdk_version=ppu_sdk_version,
         )
         results[filepath] = res
 
@@ -1301,7 +1300,7 @@ def sailify_extra_files_recursive(
         Dict mapping absolute input path -> SailifyResult.
     """
     output_directory = os.path.abspath(output_directory)
-    _maybe_enable_sdk_version_mappings(detect_ppu_sdk_version())
+    ppu_sdk_version = detect_ppu_sdk_version()
     if install_ppu_compat:
         _ensure_ppu_compat(output_directory, stub_probe=stub_probe)
     _header_include_dirs = header_include_dirs or []
@@ -1339,6 +1338,7 @@ def sailify_extra_files_recursive(
             backup=backup,
             inject_compat_include=inject_compat_include,
             inject_compat_include_ignores=inject_compat_include_ignores or [],
+            ppu_sdk_version=ppu_sdk_version,
         )
         results[filepath] = res
         processed_count += 1

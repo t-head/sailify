@@ -12309,6 +12309,25 @@ PPU_SDK_2_2_IDENTIFIER_MAP = collections.OrderedDict([
     ("__NV_THREAD_SCOPE_SYSTEM", "__HG_THREAD_SCOPE_SYSTEM"),
 ])
 
+PPU_SDK_2_2_2_IDENTIFIER_MAP = collections.OrderedDict([
+    ("__nv_erff", "__hg_erff"),
+    ("__nv_erfcf", "__hg_erfcf"),
+    ("__nv_erfcinvf", "__hg_erfcinvf"),
+    ("__nv_erfcxf", "__hg_erfcxf"),
+    ("__nv_erfinvf", "__hg_erfinvf"),
+    ("__nv_erf", "__hg_erf"),
+    ("__nv_erfc", "__hg_erfc"),
+    ("__nv_erfcinv", "__hg_erfcinv"),
+    ("__nv_erfcx", "__hg_erfcx"),
+    ("__nv_erfinv", "__hg_erfinv"),
+])
+
+PPU_SDK_VERSION_MAPPINGS = (
+    ("identifier", (2, 2, 0), PPU_SDK_2_2_IDENTIFIER_MAP),
+    ("identifier", (2, 2, 2), PPU_SDK_2_2_2_IDENTIFIER_MAP),
+    ("include", (2, 3, 0), PPU_SDK_2_3_RENAME_MAP),
+)
+
 CUDA_SPECIAL_MAP = collections.OrderedDict([
     ("cusparseDirection_t", "acsparseDirection_t"),
     ("cusparseSolvePolicy_t", "acsparseSolvePolicy_t"),

@@ -1,0 +1,74 @@
+{
+  "custom_impls": [
+    {
+      "library": "nvidia-ml",
+      "function": "hgmlDeviceGetGridLicensableFeatures",
+      "impl": "    fprintf(stderr, \"[nvidia-ml] hgmlDeviceGetGridLicensableFeatures is not supported by HGGC, return HGML_ERROR_NOT_SUPPORTED.\\n\");\n    return HGML_ERROR_NOT_SUPPORTED;"
+    },
+    {
+      "library": "nvidia-ml",
+      "function": "hgmlDeviceGetGridLicensableFeatures_v2",
+      "impl": "    fprintf(stderr, \"[nvidia-ml] hgmlDeviceGetGridLicensableFeatures_v2 is not supported by HGGC, return HGML_ERROR_NOT_SUPPORTED.\\n\");\n    return HGML_ERROR_NOT_SUPPORTED;"
+    },
+    {
+      "library": "nvidia-ml",
+      "function": "hgmlDeviceGetGridLicensableFeatures_v3",
+      "impl": "    fprintf(stderr, \"[nvidia-ml] hgmlDeviceGetGridLicensableFeatures_v3 is not supported by HGGC, return HGML_ERROR_NOT_SUPPORTED.\\n\");\n    return HGML_ERROR_NOT_SUPPORTED;"
+    },
+    {
+      "library": "nvidia-ml",
+      "function": "hgmlDeviceGetGridLicensableFeatures_v4",
+      "impl": "    fprintf(stderr, \"[nvidia-ml] hgmlDeviceGetGridLicensableFeatures_v4 is not supported by HGGC, return HGML_ERROR_NOT_SUPPORTED.\\n\");\n    return HGML_ERROR_NOT_SUPPORTED;"
+    },
+    {
+      "library": "cublas",
+      "function": "acblasInit",
+      "impl": "    return ACBLAS_STATUS_SUCCESS;"
+    },
+    {
+      "library": "cublas",
+      "function": "typoFunctionNotThere",
+      "impl": "    return ACBLAS_STATUS_SUCCESS;"
+    },
+    {
+      "library": "cusparse",
+      "function": "acsparseSgtsv2StridedBatch_bufferSizeExt",
+      "impl": "    fprintf(stderr, \"[cusparse] acsparseSgtsv2StridedBatch_bufferSizeExt is not supported by HGGC, return ACSPARSE_STATUS_NOT_SUPPORTED.\\n\");\n    return ACSPARSE_STATUS_NOT_SUPPORTED;"
+    },
+    {
+      "library": "cusparse",
+      "function": "acsparseSgtsv2StridedBatch",
+      "impl": "    fprintf(stderr, \"[cusparse] acsparseSgtsv2StridedBatch is not supported by HGGC, return ACSPARSE_STATUS_NOT_SUPPORTED.\\n\");\n    return ACSPARSE_STATUS_NOT_SUPPORTED;"
+    },
+    {
+      "library": "cusparse",
+      "function": "acsparseDgtsv2StridedBatch_bufferSizeExt",
+      "impl": "    fprintf(stderr, \"[cusparse] acsparseDgtsv2StridedBatch_bufferSizeExt is not supported by HGGC, return ACSPARSE_STATUS_NOT_SUPPORTED.\\n\");\n    return ACSPARSE_STATUS_NOT_SUPPORTED;"
+    },
+    {
+      "library": "cusparse",
+      "function": "acsparseDgtsv2StridedBatch",
+      "impl": "    fprintf(stderr, \"[cusparse] acsparseDgtsv2StridedBatch is not supported by HGGC, return ACSPARSE_STATUS_NOT_SUPPORTED.\\n\");\n    return ACSPARSE_STATUS_NOT_SUPPORTED;"
+    },
+    {
+      "library": "cusparse",
+      "function": "acsparseCgtsv2StridedBatch_bufferSizeExt",
+      "impl": "    fprintf(stderr, \"[cusparse] acsparseCgtsv2StridedBatch_bufferSizeExt is not supported by HGGC, return ACSPARSE_STATUS_NOT_SUPPORTED.\\n\");\n    return ACSPARSE_STATUS_NOT_SUPPORTED;"
+    },
+    {
+      "library": "cusparse",
+      "function": "acsparseCgtsv2StridedBatch",
+      "impl": "    fprintf(stderr, \"[cusparse] acsparseCgtsv2StridedBatch is not supported by HGGC, return ACSPARSE_STATUS_NOT_SUPPORTED.\\n\");\n    return ACSPARSE_STATUS_NOT_SUPPORTED;"
+    },
+    {
+      "library": "cusparse",
+      "function": "acsparseZgtsv2StridedBatch_bufferSizeExt",
+      "impl": "    fprintf(stderr, \"[cusparse] acsparseZgtsv2StridedBatch_bufferSizeExt is not supported by HGGC, return ACSPARSE_STATUS_NOT_SUPPORTED.\\n\");\n    return ACSPARSE_STATUS_NOT_SUPPORTED;"
+    },
+    {
+      "library": "cusparse",
+      "function": "acsparseZgtsv2StridedBatch",
+      "impl": "    fprintf(stderr, \"[cusparse] acsparseZgtsv2StridedBatch is not supported by HGGC, return ACSPARSE_STATUS_NOT_SUPPORTED.\\n\");\n    return ACSPARSE_STATUS_NOT_SUPPORTED;"
+    }
+  ]
+}

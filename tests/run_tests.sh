@@ -246,6 +246,22 @@ PRF=${PRF:-0}
 let BPASS=BPASS+PRP
 let BFAIL=BFAIL+PRF
 let FAIL=FAIL+PRC
+
+echo "== phase 8: custom_impl stub customization =="
+CRC=0
+"$PYTHON" "${SCRIPT_DIR}/custom_impl_test.py" > "${OUT}/logs/custom_impl.log" 2>&1 || CRC=1
+cat "${OUT}/logs/custom_impl.log"
+CRP=0
+CRF=0
+grep "^CUSTOM_IMPL_SUMMARY" "${OUT}/logs/custom_impl.log" > "${OUT}/crs.txt" 2>/dev/null || true
+read -r _ CRPW CRFW < "${OUT}/crs.txt" || true
+CRP=${CRPW#pass=}
+CRF=${CRFW#fail=}
+CRP=${CRP:-0}
+CRF=${CRF:-0}
+let BPASS=BPASS+CRP
+let BFAIL=BFAIL+CRF
+let FAIL=FAIL+CRC
 echo ""
 echo "Artifacts and logs kept under: ${OUT}"
 

@@ -56,14 +56,14 @@ def test_packaged_config_applied_in_header():
     """The shipped custom_impl.json customizes the cusparse gtsv2 stubs."""
     failures = []
     hdr = G.generate_stubs_header(stub_probe=False)
-    if "return ACSPARSE_STATUS_NOT_SUPPORTED;" not in hdr:
-        failures.append("cusparse custom impl missing from generated header")
-    if "acsparseSgtsv2StridedBatch is not supported." in hdr:
+    i = hdr.find("acsparseSgtsv2StridedBatch(")
+    if i < 0:
+        return ["acsparseSgtsv2StridedBatch stub missing from generated header"]
+    body = hdr[i:hdr.find("\n}", i)]
+    if "return ACSPARSE_STATUS_NOT_SUPPORTED;" not in body:
+        failures.append("custom impl missing from the target stub body")
+    if "exit(1)" in body:
         failures.append("customized acsparseSgtsv2StridedBatch kept the fatal body")
-    plain = hdr.find("acblasAsumEx_64(")
-    custom = hdr.find("acsparseSgtsv2StridedBatch(")
-    if 0 <= custom < plain and "exit(1)" in hdr[custom:plain]:
-        failures.append("customized stub body contains exit(1)")
     return failures
 
 

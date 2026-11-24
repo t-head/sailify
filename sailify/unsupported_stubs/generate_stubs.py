@@ -87,7 +87,8 @@ def _generate_stub_function(api: dict, custom_impl: str = None) -> str:
         body_lines.append(f"    {void_casts};")
 
     if custom_impl is not None:
-        body_lines.append(custom_impl.rstrip("\n"))
+        body_lines.append(
+            custom_impl if custom_impl.endswith("\n") else custom_impl + "\n")
     else:
         body_lines.append(f'    fprintf(stderr, "{func_name} is not supported.\\n");')
         body_lines.append("    exit(1);")

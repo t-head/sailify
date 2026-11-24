@@ -1,15 +1,4 @@
 {
-  "not_supported_status": {
-    "acblasStatus_t": "ACBLAS_STATUS_NOT_SUPPORTED",
-    "acdnnStatus_t": "ACDNN_STATUS_NOT_SUPPORTED",
-    "acfftResult": "ACFFT_NOT_SUPPORTED",
-    "acsolverStatus_t": "ACSOLVER_STATUS_NOT_SUPPORTED",
-    "acsparseStatus_t": "ACSPARSE_STATUS_NOT_SUPPORTED",
-    "HGresult": "HGGC_ERROR_NOT_SUPPORTED",
-    "hggcError_t": "hggcErrorNotSupported",
-    "hgmlReturn_t": "HGML_ERROR_NOT_SUPPORTED",
-    "HGptiResult": "HGPTI_ERROR_NOT_SUPPORTED"
-  },
   "apis": [
     {
       "name": "acblasSetKernelStream",

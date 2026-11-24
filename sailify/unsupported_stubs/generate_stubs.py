@@ -1,15 +1,13 @@
-"""Generate ``ppu_unsupported_stubs.h``: ``static inline`` stubs that print an
-error and return the corresponding not-supported status when their return type
-defines one. Other return types retain ``exit(1)`` for unsupported APIs.
+"""Generate ``ppu_unsupported_stubs.h``: error-and-``exit(1)`` stubs for APIs
+the PPU SDK does not implement.
 
-``unsupported_apis.json`` is the superset of possibly-unsupported APIs.
-With ``stub_probe=True`` (default) the installed SDK's exported symbols are
-probed (see ``probe.py``) and a stub is emitted only for APIs no host library
-provides.  Libraries that cannot be probed keep their stubs with their
-``version`` begin/end gate, and so does everything when ``stub_probe=False``.
-
-When ``SAILIFY_STUB_PROBE_REPORT`` is set, the APIs found already supported
-(stubs dropped) are printed to stdout.
+``unsupported_apis.json`` is the API superset.  With ``stub_probe=True``
+(default) stubs are emitted only for APIs no probed host library exports;
+unprobed libraries fall back to their ``version`` gate, as does everything
+when ``stub_probe=False``.  ``custom_impl.json`` entries override the body
+of the matching stub; entries matching no generated stub are ignored.  With
+``SAILIFY_STUB_PROBE_REPORT`` set, stubs dropped as already supported are
+printed to stdout.
 """
 
 import json
@@ -21,6 +19,7 @@ from .probe import probe_supported_apis
 log = logging.getLogger(__name__)
 
 _REPORT_ENV = "SAILIFY_STUB_PROBE_REPORT"
+
 
 def _format_param(decl_template: str, name: str) -> str:
     """Format a parameter declaration from a type_str template.
@@ -37,8 +36,8 @@ def _format_param(decl_template: str, name: str) -> str:
 def _version_gate(api: dict) -> str:
     """``#if`` line limiting a stub to its unsupported SDK-version range.
 
-    PPU_SDK_VERSION == 0 (unknown) is included so the legacy behavior of
-    defining every stub is kept when the SDK version could not be detected.
+    PPU_SDK_VERSION == 0 (unknown) keeps the legacy behavior of defining
+    every stub when the SDK version could not be detected.
     """
     ver = api.get("version") or {}
     begin = ver.get("begin")
@@ -55,17 +54,23 @@ def _version_gate(api: dict) -> str:
     return "#if " + " || ".join(conds)
 
 
-def _generate_stub_function(api: dict, not_supported_status: dict) -> str:
-    """Generate a single ``static inline`` stub function for *api*.
+def _load_custom_impls() -> dict:
+    """Read ``custom_impl.json``: {(library, function): impl}."""
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "custom_impl.json")
+    if not os.path.isfile(path):
+        return {}
+    with open(path) as f:
+        entries = json.load(f)["custom_impls"]
+    return {(e["library"], e["function"]): e["impl"] for e in entries}
 
-    *api* is a dict with PPU-mapped keys: name, return_type, parameters, library.
-    *not_supported_status* maps return types to status values from the JSON config.
-    """
+
+def _generate_stub_function(api: dict, custom_impl: str = None) -> str:
+    """One ``static inline`` stub; *custom_impl* statements replace the fatal body."""
     func_name = api["name"]
     return_type = api["return_type"].strip()
     params = api["parameters"]
 
-    # Build parameter list
     param_decls = []
     param_names = []
     for p in params:
@@ -73,24 +78,18 @@ def _generate_stub_function(api: dict, not_supported_status: dict) -> str:
         param_decls.append(decl)
         param_names.append(p["name"])
 
-    if param_decls:
-        params_str = ", ".join(param_decls)
-    else:
-        params_str = "void"
+    params_str = ", ".join(param_decls) if param_decls else "void"
     decl = f"{return_type} {func_name}({params_str})"
 
-    # Build the stub body
     body_lines = []
-
     if param_names:
         void_casts = "; ".join(f"(void){n}" for n in param_names)
         body_lines.append(f"    {void_casts};")
 
-    body_lines.append(f'    fprintf(stderr, "{func_name} is not supported.\\n");')
-    not_supported = not_supported_status.get(return_type)
-    if not_supported is not None:
-        body_lines.append(f"    return {not_supported};")
+    if custom_impl is not None:
+        body_lines.append(custom_impl.rstrip("\n"))
     else:
+        body_lines.append(f'    fprintf(stderr, "{func_name} is not supported.\\n");')
         body_lines.append("    exit(1);")
         if return_type and return_type != "void":
             body_lines.append(f"    return ({return_type})0;  /* unreachable */")
@@ -123,7 +122,7 @@ def generate_stubs_header(stub_probe=True):
         data = json.load(f)
 
     apis = data["apis"]
-    not_supported_status = data.get("not_supported_status", {})
+    custom_impls = _load_custom_impls()
 
     probe = probe_supported_apis(apis) if stub_probe else None
     if probe is not None:
@@ -152,9 +151,10 @@ def generate_stubs_header(stub_probe=True):
             # The probe is specific to the concrete SDK; unprobed libraries
             # fall back to the compile-time version gate.
             gate = "" if probed else _version_gate(api)
+            custom_impl = custom_impls.get((lib_name, api["name"]))
             if gate:
                 lines.append(gate)
-            lines.append(_generate_stub_function(api, not_supported_status))
+            lines.append(_generate_stub_function(api, custom_impl))
             if gate:
                 lines.append("#endif")
             lines.append("")

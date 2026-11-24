@@ -18,7 +18,8 @@ Extend existing data/configuration for cases the current machinery already handl
 |---|---|
 | identifier/type/header/API mappings | `sailify/cuda_to_ppu_mappings.py` |
 | nvcc option mappings and translation behavior | `sailify/nvcc_hgcc_options.py` |
-| Stub signatures, version ranges, not-supported return constants | `sailify/unsupported_stubs/unsupported_apis.json` (`apis`, `not_supported_status`) |
+| Stub signatures, version ranges | `sailify/unsupported_stubs/unsupported_apis.json` (`apis`) |
+| Custom stub bodies for selected APIs | `sailify/unsupported_stubs/custom_impl.json` |
 | Stub generation or SDK-library probing behavior | `sailify/unsupported_stubs/generate_stubs.py`, `probe.py` |
 | Conversion, mapping activation, compatibility-header generation/installation | `sailify/sailify_python.py` |
 | SDK/runtime version detection | `sailify/ppu_sdk_version.py` |

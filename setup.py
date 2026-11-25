@@ -10,7 +10,7 @@ if os.path.exists('README.md'):
 
 setup(
     name='sailify',
-    version='1.0.1',
+    version='1.0.2',
     description='Generic CUDA to PPU source code conversion tool',
     long_description=long_description,
     long_description_content_type='text/markdown',

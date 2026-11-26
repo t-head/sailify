@@ -1,0 +1,115 @@
+name: sail nightly build sailify
+
+on:
+  push:
+    branches:
+      - 'ci/add_nightly_build_fj'
+  schedule:
+    # Daily at 11:30 UTC (19:30 Beijing time), same slot as the other SAIL nightlies.
+    - cron: '30 11 * * *'
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: 'Name of the package to build and upload'
+        required: true
+        type: string
+        default: sailify
+      framework:
+        description: 'Name of the dependent framework; sailify depends on none, so keep none'
+        required: true
+        type: string
+        default: none
+      python_versions:
+        description: 'JSON array; allowed values: 38, 310, 312'
+        required: true
+        type: string
+        default: '["312"]'
+      os_versions:
+        description: 'JSON array; allowed values: ubuntu2004, ubuntu2204, ubuntu2404, alios7u2'
+        required: true
+        type: string
+        default: '["ubuntu2404"]'
+      runtime_versions:
+        description: 'JSON array; allowed HGGCRT versions: 2, 3'
+        required: true
+        type: string
+        default: '["3"]'
+      torch_versions:
+        description: 'JSON array; allowed values: 2.10.0, 2.13.0; an empty string skips Torch installation'
+        required: true
+        type: string
+        default: '[""]'
+      sdk_versions:
+        description: 'JSON array; allowed values: 2.1.1, 2.2.0, 2.2.1'
+        required: true
+        type: string
+        default: '["2.2.1"]'
+      branch:
+        description: 'Source branch, tag, or full commit SHA; leave empty to use the commit that triggered the workflow'
+        required: false
+        type: string
+        default: ''
+      package_version:
+        description: 'Artifactory package version and automatic upload directory prefix; must track the version in setup.py'
+        required: true
+        type: string
+        default: 'main'
+      package_edition:
+        description: 'Artifactory package edition; defaults to oe, matching the release workflow'
+        required: true
+        type: string
+        default: oe
+      package_type:
+        description: 'Artifactory package type; defaults to pypi'
+        required: false
+        type: string
+        default: pypi
+      build_command:
+        description: 'Custom Bash build command; leave empty to build sailify from the repository root; only trusted configuration is accepted'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: nightly-build-${{ inputs.package_name || 'sailify' }}-${{ inputs.branch || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: t-head/ci-infra/.github/workflows/nightly-build.yml@main
+    secrets:
+      template_token: ${{ secrets.TEMPLATE_TOKEN }}
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+    with:
+      # Scheduled runs carry no inputs; the pinned defaults below still apply.
+      # package_version must be bumped together with setup.py, which hardcodes the
+      # version; AGENTS.md requires a bump for every PPU SDK adaptation.
+      package_name: ${{ inputs.package_name || 'sailify' }}
+      framework: ${{ inputs.framework || 'none' }}
+      template_repository: t-head/ci-infra
+      template_ref: main
+      python_versions: ${{ inputs.python_versions || '["312"]' }}
+      os_versions: ${{ inputs.os_versions || '["ubuntu2404"]' }}
+      runtime_versions: ${{ inputs.runtime_versions || '["3"]' }}
+      # sailify never imports torch, so an empty version keeps the build lean.
+      torch_versions: ${{ inputs.torch_versions || '[""]' }}
+      sdk_versions: ${{ inputs.sdk_versions || '["2.2.1"]' }}
+      branch: ${{ inputs.branch || '' }}
+      package_version: ${{ inputs.package_version || 'main' }}
+      package_edition: ${{ inputs.package_edition || 'oe' }}
+      package_type: ${{ inputs.package_type || 'pypi' }}
+      build_command: |
+        ${{ inputs.build_command || 'unset PIP_INDEX_URL
+        # sailify is a pure-Python wheel: setup.py hardcodes the version, so the
+        # build needs no git metadata, no submodules, and no PPU SDK toolchain.
+        pip uninstall -y sailify || true
+        rm -rf dist build
+        # Same build tooling as the temporary wheel workflow.
+        pip install --no-input wheel setuptools
+        python3 setup.py bdist_wheel
+        ls -lh dist/*.whl' }}

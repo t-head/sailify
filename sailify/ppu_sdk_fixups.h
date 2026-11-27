@@ -454,10 +454,10 @@ static inline acblasStatus_t acblasGemmStridedBatchedEx(acblasHandle_t handle,
 #endif /* !__HGGCCC_RTC__ */
 
 /* PPU SDK's hggc/functional port lacks hggc::maximum / hggc::minimum
- * (CCCL cuda::maximum / cuda::minimum, which sailify maps onto).  < 20300
- * keeps the shim for every 2.2.x patch release.  Device-safe, so it
+ * (CCCL cuda::maximum / cuda::minimum, which sailify maps onto).  < 20400
+ * keeps the shim for every 2.3.x patch release.  Device-safe, so it
  * also stays visible under RTC. */
-#if defined(__cplusplus) && (PPU_SDK_VERSION < 20300)
+#if defined(__cplusplus) && (PPU_SDK_VERSION < 20400)
 #ifndef __host__
 #define __host__ __attribute__((host))
 #endif

@@ -1,0 +1,7 @@
+# Cases using CUDA APIs converted to the 2v3 hggc_/SAIL_ names; older SDKs
+# keep CUDA-shaped sanitizer headers and CCCL spellings instead.
+sanitizer_api/common_api
+sanitizer_api/patching_api
+sanitizer_api/cbid_api
+cccl_macro_api/macros
+texture_api/types

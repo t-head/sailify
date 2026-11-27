@@ -9,7 +9,6 @@ sys.path.insert(0, os.path.join(HERE, "lib"))
 from map_flags import translate
 
 _RELEASE_VER_RE = re.compile(r"Release version (\d+)\.(\d+)")
-_MIN_SDK_INT = 20200
 
 
 def _sdk_version_int(hgcc):
@@ -26,8 +25,8 @@ def _sdk_version_int(hgcc):
     return int(m.group(1)) * 10000 + int(m.group(2)) * 100
 
 
-def _load_min_sdk_cases(vendored_dir):
-    path = os.path.join(vendored_dir, "needs_ppu_sdk_2v2.txt")
+def _load_case_list(vendored_dir, filename):
+    path = os.path.join(vendored_dir, filename)
     cases = set()
     if os.path.isfile(path):
         with open(path) as fh:
@@ -36,6 +35,14 @@ def _load_min_sdk_cases(vendored_dir):
                 if line and not line.startswith("#"):
                     cases.add(line)
     return cases
+
+
+# Compile-skip gates: cases listed in these files need at least the given
+# SDK version, so older SDKs skip them instead of failing.
+_SDK_GATES = (
+    ("needs_ppu_sdk_2v2.txt", 20200, "2.2"),
+    ("needs_ppu_sdk_2v3.txt", 20300, "2.3"),
+)
 
 
 def main(argv):
@@ -49,11 +56,16 @@ def main(argv):
     from sailify.sailify_python import sailify
 
     sdk_int = _sdk_version_int(args.hgcc)
-    min_sdk_cases = _load_min_sdk_cases(args.vendored_dir)
-    skip_set = min_sdk_cases if (sdk_int is not None and sdk_int < _MIN_SDK_INT) else set()
-    if skip_set:
-        print("vendored: PPU SDK %d < 2.2, skipping %d cases (needs_ppu_sdk_2v2.txt)"
-              % (sdk_int, len(skip_set)))
+    skip_reasons = {}
+    if sdk_int is not None:
+        for filename, min_sdk, label in _SDK_GATES:
+            if sdk_int >= min_sdk:
+                continue
+            for case in _load_case_list(args.vendored_dir, filename):
+                skip_reasons[case] = "needs PPU SDK >= " + label
+    if skip_reasons:
+        print("vendored: PPU SDK %d, skipping %d cases (sdk-gated)"
+              % (sdk_int, len(skip_reasons)))
 
     os.makedirs(args.out, exist_ok=True)
     cl = open(args.cases_log, "w")
@@ -101,8 +113,9 @@ def main(argv):
         for f in sorted(conv):
             rel = os.path.relpath(f, outdir)[:-3]
             key = cat + "/" + rel
-            if key in skip_set:
-                cl.write("SKIP compile vendored " + key + " (needs PPU SDK >= 2.2)" + chr(10))
+            if key in skip_reasons:
+                cl.write("SKIP compile vendored " + key + " ("
+                         + skip_reasons[key] + ")" + chr(10))
                 nskip += 1
                 continue
             obj = os.path.join(args.out, "obj_" + cat + "_" + rel.replace("/", "_") + ".o")

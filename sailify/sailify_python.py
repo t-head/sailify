@@ -229,7 +229,16 @@ _SDK23_SHIM_HEADERS = [
     ("hggc_vector_functions.hpp", "vector_functions.hpp"),
     ("hggc_vector_types.h", "vector_types.h"),
     ("hggc_texture_types.h", "texture_types.h"),
-    ("hggc_texture_types.hpp", "hggc_texture_types.h"),
+    ("hggc_sanitizer.h", "sanitizer.h"),
+    ("hggc_sanitizer_barrier.h", "sanitizer_barrier.h"),
+    ("hggc_sanitizer_callbacks.h", "sanitizer_callbacks.h"),
+    ("hggc_sanitizer_driver_cbid.h", "sanitizer_driver_cbid.h"),
+    ("hggc_sanitizer_memory.h", "sanitizer_memory.h"),
+    ("hggc_sanitizer_patching.h", "sanitizer_patching.h"),
+    ("hggc_sanitizer_result.h", "sanitizer_result.h"),
+    ("hggc_sanitizer_runtime_cbid.h", "sanitizer_runtime_cbid.h"),
+    ("hggc_sanitizer_stream.h", "sanitizer_stream.h"),
+    ("hggc_surface_types.h", "surface_types.h"),
 ]
 
 
@@ -592,7 +601,8 @@ def get_ppu_file_path(rel_filepath: str) -> str:
     return rel_filepath
 
 
-def _mask_comments_and_strings(source: str, mask_includes: bool = False) -> str:
+def _mask_comments_and_strings(source: str, mask_includes: bool = False,
+                               mask_string_contents: bool = False) -> str:
     """Mask comments and char literals with 'x' to gate identifier replacement."""
     include_ends = {
         start: end for start, end, _path in _iter_header_names(source)
@@ -633,7 +643,7 @@ def _mask_comments_and_strings(source: str, mask_includes: bool = False) -> str:
     while i < n:
         c = source[i]
 
-        if in_include[i] and not mask_includes:
+        if in_include[i] and not mask_includes and in_context == '':
             result.append(c)
             i += 1
             continue
@@ -722,18 +732,25 @@ def _mask_comments_and_strings(source: str, mask_includes: bool = False) -> str:
 
         elif in_context == '"':
             if c == '\\':
-                result.append(c)
+                result.append('x' if mask_string_contents else c)
                 i += 1
                 if i < n:
-                    result.append(source[i])
+                    result.append('x' if mask_string_contents else source[i])
                     i += 1
                 continue
             if c == '"':
                 in_context = ''
-            result.append(c)
+            result.append('x' if mask_string_contents else c)
             i += 1
 
         elif in_context == "'":
+            if c == '\n' or c == '\r':
+                # Unterminated char literal cannot cross a line: recover so
+                # apostrophes (#error can't, 1'000) do not mask the file tail.
+                in_context = ''
+                result.append(c)
+                i += 1
+                continue
             if c == '\\':
                 result.append('x')
                 i += 1
@@ -752,11 +769,11 @@ def _mask_comments_and_strings(source: str, mask_includes: bool = False) -> str:
             close_pos = source.find(close_seq, i)
             if close_pos == -1:
                 for j in range(i, n):
-                    result.append(source[j])
+                    result.append('x' if mask_string_contents else source[j])
                 i = n
             else:
                 for j in range(i, close_pos):
-                    result.append(source[j])
+                    result.append('x' if mask_string_contents else source[j])
                 for _ in range(close_pos, close_pos + len(close_seq)):
                     result.append('x')
                 i = close_pos + len(close_seq)
@@ -815,11 +832,25 @@ def _rewrite_include_directives(source: str, ppu_sdk_version=None) -> str:
     from .cuda_to_ppu_mappings import CUDA_INCLUDE_MAP
 
     mapping = dict(CUDA_INCLUDE_MAP)
-    mapping.update(_get_versioned_mappings("include", ppu_sdk_version))
+    versioned_includes = _get_versioned_mappings("include", ppu_sdk_version)
+    mapping.update(versioned_includes)
+    include_prefixes = _get_versioned_mappings("include_prefix", ppu_sdk_version)
     _sorted_pairs = sorted(mapping.items(), key=lambda kv: -len(kv[0]))
+    masked = None
     parts = []
     last_end = 0
     for start, end, path in _iter_header_names(source):
+        # Skip directives inside comments (comments mask every char, so
+        # probe a path char that is not a literal 'x').  String and raw
+        # string bodies stay rewritable, like the identifier passes.
+        if masked is None:
+            masked = _mask_comments_and_strings(source)
+        probe = next(
+            (j for j in range(start + 1, end - 1) if source[j] != 'x'),
+            None,
+        )
+        if probe is not None and masked[probe] == 'x':
+            continue
         new_path = path
 
         if '/' not in new_path and new_path in _BARE_ONLY_INCLUDES:
@@ -835,11 +866,31 @@ def _rewrite_include_directives(source: str, ppu_sdk_version=None) -> str:
             else:
                 last_slash = new_path.rfind('/')
                 filename = new_path[last_slash + 1:] if last_slash >= 0 else new_path
-                if filename == cuda_path:
+                # Versioned root-header renames are root-level only.
+                root_only = '/' not in cuda_path and cuda_path in versioned_includes
+                if filename == cuda_path and not (root_only and last_slash >= 0):
                     if last_slash >= 0:
                         new_path = new_path[:last_slash + 1] + ppu_path
                     else:
                         new_path = ppu_path
+
+        # Rewrite the leading path component only (thrust/ -> sail/thrust/).
+        # A '.' after the stem would also drag in unrelated project
+        # headers (cooperative_groups.config.h); bare cooperative_groups.h
+        # stays covered via the exact ".h" case.
+        for inc_prefix, inc_replacement in include_prefixes.items():
+            if '/' in inc_prefix:
+                if new_path.startswith(inc_prefix):
+                    new_path = inc_replacement + new_path[len(inc_prefix):]
+            else:
+                stem_len = len(inc_prefix)
+                rest = new_path[stem_len:]
+                if (
+                    new_path[:stem_len] == inc_prefix
+                    and (rest == '' or rest[0] == '/' or rest == '.h')
+                ):
+                    new_path = inc_replacement + rest
+
         if new_path != path:
             parts.append(source[last_end:start])
             parts.append(source[start] + new_path + source[end - 1])
@@ -856,6 +907,223 @@ def _ppu_repl(match, identifier_map):
     if word in _CUSTOM_SPECIAL_MAP:
         return _CUSTOM_SPECIAL_MAP[word]
     return identifier_map.get(word, _PPU_MAP.get(word, word))
+
+
+def _masked_replace(source, regex, repl, mask_includes=False):
+    """Replace *regex* matches in *source*, skipping comments, string
+    literals and (optionally) include paths."""
+    masked = _mask_comments_and_strings(source, mask_includes=mask_includes)
+    parts = []
+    last = 0
+    for m in regex.finditer(source):
+        if masked[m.start()] == "x":
+            continue
+        parts.append(source[last:m.start()])
+        parts.append(repl(m))
+        last = m.end()
+    parts.append(source[last:])
+    return "".join(parts)
+
+
+_NS_RE_CACHE: Dict[tuple, re.Pattern] = {}
+
+_NS_WS = " \t\r\n\x0b\x0c"
+_NS_IDENT = re.compile(r"[A-Za-z_]\w*")
+# Keywords after which a following ::name is still the global scope;
+# any other identifier there means a nested qualification (foo ::name).
+_NS_GLOBAL_KEYWORDS = {
+    "using", "namespace", "typename", "template", "friend", "typedef",
+    "return", "case", "new", "delete", "throw", "else", "do",
+    "co_await", "co_return", "co_yield", "sizeof", "alignof", "typeid",
+    "decltype", "noexcept", "operator",
+    # Declaration specifiers and type keywords.
+    "const", "constexpr", "static", "extern", "inline", "virtual",
+    "explicit", "mutable", "volatile", "unsigned", "signed", "long",
+    "short", "auto", "void", "bool", "char", "int", "float", "double",
+    "class", "struct", "union", "enum", "public", "private", "protected",
+}
+# ')' makes ::name global after these, nested otherwise (decltype(x)::cub).
+_NS_STMT_PAREN_KEYWORDS = {"if", "for", "while", "switch"}
+
+
+def _namespace_regex(ns_map):
+    """Regex matching bare namespace words (thrust::x, namespace thrust)
+    or globally qualified ones (::thrust::x).  Lookbehinds keep sail::*
+    and foo::cub untouched while still allowing case 1:thrust::x
+    (single ':') and keyword::word (return::cub, namespace::thrust);
+    '/' stays allowed: include paths are masked by this pass.  Real
+    namespace references are decided in _namespace_repl_factory."""
+    key = tuple(sorted(ns_map))
+    regex = _NS_RE_CACHE.get(key)
+    if regex is None:
+        alt = "|".join(re.escape(k) for k in key)
+        regex = re.compile(
+            r"(?<![\w.])(?<!::)(" + alt + r")(?![\w])"
+            r"|::(" + alt + r")(?![\w])"
+        )
+        _NS_RE_CACHE[key] = regex
+    return regex
+
+
+def _ns_next_token(source, pos):
+    """First significant token at/after *pos* ('::' or one word/char)."""
+    i, n = pos, len(source)
+    while i < n:
+        c = source[i]
+        if c in _NS_WS:
+            i += 1
+        elif c == '/' and i + 1 < n and source[i + 1] == '/':
+            j = source.find('\n', i)
+            i = n if j == -1 else j + 1
+        elif c == '/' and i + 1 < n and source[i + 1] == '*':
+            j = source.find('*/', i + 2)
+            i = n if j == -1 else j + 2
+        else:
+            break
+    if i >= n:
+        return None
+    if source[i:i + 2] == '::':
+        return '::'
+    m = _NS_IDENT.match(source, i)
+    return m.group(0) if m else source[i]
+
+
+def _ns_prev_token(source, pos):
+    """(token, start) of the last significant token before *pos*, or
+    (None, 0) at start of file.  Skips whitespace and comments."""
+    i = pos
+    while i > 0:
+        c = source[i - 1]
+        if c in _NS_WS:
+            i -= 1
+        elif i >= 2 and source[i - 2:i] == '*/':
+            j = source.rfind('/*', 0, i - 2)
+            i = 0 if j == -1 else j
+        else:
+            # Line comments: only when the text before the word on this
+            # line has an even number of quotes (so "a//b" is a string).
+            line_start = source.rfind('\n', 0, i) + 1
+            k = source.rfind('//', line_start, i)
+            if k != -1 and source.count('"', line_start, k) % 2 == 0:
+                i = k  # comment runs to end of line
+                continue
+            break
+    if i <= 0:
+        return None, 0
+    j = i - 1
+    if not (source[j].isalnum() or source[j] == '_'):
+        return source[j], j
+    while j >= 0 and (source[j].isalnum() or source[j] == '_'):
+        j -= 1
+    return source[j + 1:i], j + 1
+
+
+def _ns_paren_owner(source, close_pos):
+    """Token before the '(' matching the ')' at *close_pos*, or None."""
+    depth = 0
+    i = close_pos
+    while i >= 0:
+        c = source[i]
+        if c == ')':
+            depth += 1
+        elif c == '(':
+            depth -= 1
+            if depth == 0:
+                tok, _ = _ns_prev_token(source, i)
+                return tok
+        i -= 1
+    return None
+
+
+def _ns_is_nested_before(source, prev, prev_start):
+    """True when *prev* makes a following ::name a nested qualification."""
+    if prev == '>':
+        return not (prev_start > 0 and source[prev_start - 1] == '-')  # -> vs T>
+    if prev == ')':
+        return _ns_paren_owner(source, prev_start) not in _NS_STMT_PAREN_KEYWORDS
+    if prev == ']':
+        return True
+    return bool(_NS_IDENT.fullmatch(prev or '')) and prev not in _NS_GLOBAL_KEYWORDS
+
+
+def _namespace_repl_factory(ns_map, source):
+    # Equal-length mask for paren-owner scans: brackets inside comments
+    # and string literals must not affect nesting depth.
+    scan_source = _mask_comments_and_strings(source, mask_string_contents=True)
+
+    def _repl(match):
+        if match.group(2) is not None:
+            # ::word: keep only the global scope.  foo ::word / foo<T>::word
+            # are nested qualifications (leading :: belongs to the left
+            # operand), so require a non-identifier (or keyword) before ::.
+            prev, prev_start = _ns_prev_token(source, match.start())
+            if prev is not None and _ns_is_nested_before(scan_source, prev, prev_start):
+                return match.group(0)
+            # A bare namespace is not a value: rewrite only a
+            # qualification or an alias / using-namespace RHS, not a
+            # same-named global variable.
+            word = match.group(2)
+            nxt = _ns_next_token(source, match.end())
+            if nxt == '::':
+                return "::" + ns_map[word]
+            if prev == 'namespace' and nxt == ';':
+                return "::" + ns_map[word]      # using namespace ::cub;
+            if prev == '=':
+                name, name_start = _ns_prev_token(source, prev_start)
+                kw, _ = (
+                    _ns_prev_token(source, name_start) if name else (None, 0)
+                )
+                if name and _NS_IDENT.fullmatch(name) and kw == 'namespace':
+                    return "::" + ns_map[word]  # namespace NAME = ::word;
+            return match.group(0)
+        # Bare word: rewrite only real namespace usages so variable names
+        # (int thrust), alias declarators (namespace cub = hipcub) and
+        # namespace definitions survive, while thrust::x, using directives
+        # and alias right-hand sides still migrate.
+        word = match.group(1)
+        nxt = _ns_next_token(source, match.end())
+        prev, prev_start = _ns_prev_token(source, match.start())
+        if (
+            prev == ':'
+            and prev_start > 0
+            and source[prev_start - 1] == ':'
+        ):
+            # word sits right of a (possibly spaced) '::'
+            before, before_start = _ns_prev_token(source, prev_start - 1)
+            if nxt == '::':
+                # nested when qualified from the left (foo:: word,
+                # sail:: thrust), global when the '::' opens the scope.
+                if before is not None and _ns_is_nested_before(
+                        scan_source, before, before_start):
+                    return match.group(0)
+                return ns_map[word]
+            # `namespace NAME = :: word;` and `using namespace :: word;`
+            # resolve through the scope operator.
+            if before in ('=', 'namespace'):
+                prev, prev_start = before, before_start
+        if nxt == '::':
+            return ns_map[word]
+        if prev == 'namespace' and nxt == ';':
+            return ns_map[word]      # using namespace cub;
+        if prev == '=':
+            # namespace NAME = word; (alias right-hand side)
+            name, name_start = _ns_prev_token(source, prev_start)
+            kw, _ = _ns_prev_token(source, name_start) if name else (None, 0)
+            if name and _NS_IDENT.fullmatch(name) and kw == 'namespace':
+                return ns_map[word]
+        return match.group(0)
+    return _repl
+
+
+def _rewrite_namespaces(source, ppu_sdk_version):
+    """Apply the SDK-versioned namespace migrations (thrust -> sail::thrust)."""
+    ns_map = _get_versioned_mappings("namespace", ppu_sdk_version)
+    if not ns_map:
+        return source
+    return _masked_replace(
+        source, _namespace_regex(ns_map), _namespace_repl_factory(ns_map, source),
+        mask_includes=True,
+    )
 
 
 def preprocessor(
@@ -936,6 +1204,30 @@ def preprocessor(
         _last_end = _m.end()
     _new_parts.append(output_source[_last_end:])
     output_source = "".join(_new_parts)
+
+    # 2b. SDK-versioned identifier-prefix families (SANITIZER_CBID_*).
+    # Single alternation, longest prefix first so shorter ones cannot
+    # shadow longer ones; includes are masked (sailify renames headers
+    # itself, never project files).
+    identifier_prefixes = _get_versioned_mappings(
+        "identifier_prefix", ppu_sdk_version)
+    if identifier_prefixes:
+        _sorted_prefixes = sorted(identifier_prefixes, key=len, reverse=True)
+        _prefix_regex = re.compile(
+            r"(?<!\w)("
+            + "|".join(re.escape(_p) for _p in _sorted_prefixes)
+            # \w keeps whole-token boundaries; also allow token pasting
+            # (SANITIZER_CBID_##domain, spaces allowed around ##).
+            + r")(?=\w|[ \t]*##)")
+        output_source = _masked_replace(
+            output_source,
+            _prefix_regex,
+            lambda m: identifier_prefixes[m.group(1)],
+            mask_includes=True,
+        )
+
+    # 2c. SDK-versioned namespace migrations (thrust -> sail::thrust).
+    output_source = _rewrite_namespaces(output_source, ppu_sdk_version)
 
     for _pat, _repl in _EXTRA_MAPPING_LISTS:
         output_source = output_source.replace(_pat, _repl)

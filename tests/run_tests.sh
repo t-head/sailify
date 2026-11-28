@@ -230,6 +230,20 @@ let BPASS=BPASS+APP
 let BFAIL=BFAIL+APF
 let FAIL=FAIL+APRC
 
+echo "== phase 6b: mapping ground-truth integrity =="
+MIRC=0
+"$PYTHON" "${SCRIPT_DIR}/mapping_integrity_test.py" > "${OUT}/logs/mapping_integrity.log" 2>&1 || MIRC=1
+cat "${OUT}/logs/mapping_integrity.log"
+MIP=0
+MIF=0
+grep "^MAPPING_INTEGRITY_SUMMARY" "${OUT}/logs/mapping_integrity.log" > "${OUT}/mis.txt" 2>/dev/null || true
+read -r _ MIPW MIFW < "${OUT}/mis.txt" || true
+MIP=${MIPW#pass=}
+MIF=${MIFW#fail=}
+let BPASS=BPASS+MIP
+let BFAIL=BFAIL+MIF
+let FAIL=FAIL+MIRC
+
 echo "== phase 7: unsupported-API stub probe =="
 PRC=0
 "$PYTHON" "${SCRIPT_DIR}/probe_test.py" > "${OUT}/logs/probe.log" 2>&1 || PRC=1

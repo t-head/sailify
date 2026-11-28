@@ -61,9 +61,13 @@ def test_pytorch_codegen_string_conversion():
     for kind, _, mapping in PPU_SDK_VERSION_MAPPINGS:
         if kind == "identifier":
             for src in mapping:
-                untouched.append(src + ";")
-                if rx.match(src + ";") is None or _PPU_MAP.get(src) != src:
-                    failures.append(src + " missing identity entry in codegen map/trie")
+                if rx.match(src + ";") is None or src not in _PPU_MAP:
+                    failures.append(src + " missing entry in codegen map/trie")
+                # Versioned keys pass through below their threshold unless
+                # the base map already maps them (then the versioned
+                # lookup overrides it above the threshold).
+                if _PPU_MAP.get(src) == src:
+                    untouched.append(src + ";")
     for src in untouched:
         if sailify_str(src) != src:
             failures.append(src + " should stay untouched")
@@ -382,14 +386,19 @@ def test_sdk_version_mapping_registry():
     groups = (
         ("identifier", (2, 2, 0), mappings.PPU_SDK_2_2_IDENTIFIER_MAP),
         ("identifier", (2, 2, 2), mappings.PPU_SDK_2_2_2_IDENTIFIER_MAP),
+        ("identifier", (2, 3, 0), mappings.PPU_SDK_2_3_IDENTIFIER_MAP),
+        ("identifier_prefix", (2, 3, 0), mappings.PPU_SDK_2_3_IDENTIFIER_PREFIX_MAP),
         ("include", (2, 3, 0), mappings.PPU_SDK_2_3_RENAME_MAP),
+        ("include_prefix", (2, 3, 0), mappings.PPU_SDK_2_3_INCLUDE_PREFIX_MAP),
+        ("namespace", (2, 3, 0), mappings.PPU_SDK_2_3_NAMESPACE_MAP),
     )
     if mappings.PPU_SDK_VERSION_MAPPINGS != groups:
-        failures.append("SDK registry must contain the three versioned mapping groups")
+        failures.append("SDK registry must contain the seven versioned mapping groups")
     snapshots = [dict(mapping) for _, _, mapping in groups]
     with patch.object(sp, "detect_ppu_sdk_version", return_value=(2, 3, 0)) as detect:
         for version in _SDK_VERSIONS + _SDK_SWITCH_VERSIONS:
-            for kind in ("identifier", "include"):
+            for kind in ("identifier", "identifier_prefix", "include",
+                         "include_prefix", "namespace"):
                 expected = {}
                 for group_kind, minimum, mapping in groups:
                     if kind == group_kind and version is not None and version >= minimum:
@@ -426,7 +435,9 @@ def _sdk_version_expected(version):
     if version is not None and version >= (2, 2, 2):
         expected = expected.replace("__nv_erff", "__hg_erff")
     if version is not None and version >= (2, 3, 0):
-        expected = expected.replace("vector_types.h", "hggc_vector_types.h")
+        # Root-level include only.
+        expected = expected.replace("#include <vector_types.h>",
+                                    "#include <hggc_vector_types.h>")
     return expected
 
 
@@ -568,9 +579,10 @@ _SDK23_RENAME_CASES = [
     ("#include <vector_functions.h>", "#include <hggc_vector_functions.h>"),
     ("#include <vector_functions.hpp>", "#include <hggc_vector_functions.hpp>"),
     ("#include <vector_types.h>", "#include <hggc_vector_types.h>"),
-    ('#include "texture_types.h.h"', '#include "hggc_texture_types.h"'),
-    ('#include "texture_types.h"', '#include "hggc_texture_types.hpp"'),
-    ('#include "sub/vector_types.h"', '#include "sub/hggc_vector_types.h"'),
+    ('#include "texture_types.h"', '#include "hggc_texture_types.h"'),
+    # Root-header renames stay root-level.
+    ('#include "sub/vector_types.h"', '#include "sub/vector_types.h"'),
+    ('#include "myproject/sanitizer.h"', '#include "myproject/sanitizer.h"'),
     ("#include <cuda_runtime.h>", "#include <hggc_runtime.h>"),
     ("#include<vector_types.h>", "#include<hggc_vector_types.h>"),
     ('#include"host_defines.h"', '#include"hggc_host_defines.h"'),
@@ -602,6 +614,259 @@ def test_sdk23_include_version_matrix():
     return failures
 
 
+_SDK23_SAIL_INCLUDE_CASES = [
+    ("#include <thrust/copy.h>", "#include <sail/thrust/copy.h>"),
+    ("#include <thrust/system/cuda/execution_policy.h>",
+     "#include <sail/thrust/system/hggc/execution_policy.h>"),
+    ("#include <cub/cub.cuh>", "#include <sail/cub/cub.cuh>"),
+    ("#include <cooperative_groups.h>", "#include <sail/cooperative_groups.h>"),
+    ('#include "cooperative_groups.h"', '#include "sail/cooperative_groups.h"'),
+    ("#include<cooperative_groups.h>", "#include<sail/cooperative_groups.h>"),
+    ("#include <cooperative_groups/cooperative_groups.h>",
+     "#include <sail/cooperative_groups/cooperative_groups.h>"),
+    ("#include <cooperative_groups/memory_pool.h>",
+     "#include <sail/cooperative_groups/memory_pool.h>"),
+    ("#if __has_include(<cooperative_groups.h>)",
+     "#if __has_include(<sail/cooperative_groups.h>)"),
+    ("#include <sanitizer.h>", "#include <hggc_sanitizer.h>"),
+    ("#include <sanitizer_result.h>", "#include <hggc_sanitizer_result.h>"),
+    ("#include <sanitizer_callbacks.h>", "#include <hggc_sanitizer_callbacks.h>"),
+    ("#include <surface_types.h>", "#include <hggc_surface_types.h>"),
+    ('#include "thrust/device_ptr.h"', '#include "sail/thrust/device_ptr.h"'),
+    # Unrelated paths that merely contain the markers stay untouched.
+    ('#include "mydir/thrust/helper.h"', '#include "mydir/thrust/helper.h"'),
+    ("#include <thrustxyz/foo.h>", "#include <thrustxyz/foo.h>"),
+    ('#include "cooperative_groups.config.h"', '#include "cooperative_groups.config.h"'),
+    ('#include "SANITIZER_CBID_helpers.h"', '#include "SANITIZER_CBID_helpers.h"'),
+    # Directives in comments stay as-is; string bodies are rewritten.
+    ("/*\n#include <thrust/copy.h>\n*/", "/*\n#include <thrust/copy.h>\n*/"),
+    ("/*\n#include \"thrust/copy.h\"\n*/", "/*\n#include \"thrust/copy.h\"\n*/"),
+    ('const char* s = R"x(\n#include <cub/cub.cuh>\n)x";',
+     'const char* s = R"x(\n#include <sail/cub/cub.cuh>\n)x";'),
+    # A path starting with the mask marker char is still a real path.
+    ("#include <x/cuda_runtime.h>", "#include <x/hggc_runtime.h>"),
+    ("/*\n#include <x/cuda_runtime.h>\n*/", "/*\n#include <x/cuda_runtime.h>\n*/"),
+]
+
+_SDK23_SAIL_SOURCE = (
+    "#include <thrust/copy.h>\n"
+    "#include <cub/cub.cuh>\n"
+    "#include <cooperative_groups.h>\n"
+    "#include <cuda_bf16.h>\n"
+    "#include <sanitizer_result.h>\n"
+    "using namespace thrust;\n"
+    "namespace cg = cooperative_groups;\n"
+    "namespace cub = hipcub;\n"
+    "namespace cub2 = cub;\n"
+    "int thrust = 1;\n"
+    "thrust::device_vector<int> v;\n"
+    "cub::DeviceRadixSort::SortKeys(d_temp, sz, k_in, k_out, n);\n"
+    "::cub::DoubleBuffer<int> db(k_in, k_out);\n"
+    "foo::cub::x m;\n"
+    "foo ::cub::y spaced;\n"
+    "foo<T>::cub::z tmpl;\n"
+    "return ::cub::reduce(a, b);\n"
+    "const ::thrust::device_vector<int>& cv;\n"
+    "if (ok) ::cub::run();\n"
+    "auto af() -> ::thrust::device_vector<int>;\n"
+    "decltype(x)::cub::w dn;\n"
+    "foo:: cub::X sp;\n"
+    "sail:: thrust::device_vector<int> sv;\n"
+    "namespace cg2 = :: cooperative_groups;\n"
+    "x = :: cub::y;\n"
+    "int n = ::thrust;\n"
+    "namespace alias2 = ::cub;\n"
+    "using namespace ::cooperative_groups;\n"
+    "return /* explanation */thrust::reduce(a, b);\n"
+    "y = x / thrust::reduce(a, b);\n"
+    "int ik = SANITIZER_INSTRUCTION_CUDA_BARRIER;\n"
+    "int ika = SANITIZER_INSTRUCTION_CUDA_BARRIER_ATTEMPT;\n"
+    "SanitizerCallbackCudaBarrier cbf;\n"
+    "Sanitizer_CudaBarrierInstructionKind bk;\n"
+    "#define CBID(domain, name) SANITIZER_CBID_##domain##_API_##name\n"
+    "float f = __bfloat162float(bf);\n"
+    "__mbarrier_init(&mbar, 1);\n"
+    "__pipeline_commit();\n"
+    "sanitizerSubscribe(&sub, &cb, 0);\n"
+    "sanitizerGetCudaBarrierCount(NULL);\n"
+    "SanitizerResult r = SANITIZER_SUCCESS;\n"
+    "int cb = SANITIZER_CBID_DRIVER_API_cuLaunchKernel;\n"
+    "int px = SANITIZER_CBID_DRIVER_API_cuCompilePtx;\n"
+    "int ra = SANITIZER_CBID_RUNTIME_API_cudaMemcpyAsync;\n"
+    "SANITIZER_CBID_DRIVER_API cbt;\n"
+    "using namespace::thrust;\n"
+    "int gm() { return::cub::min(1, 2); }\n"
+    "void hm() { if (f(\")\")) ::cub::run(); }\n"
+    "int am = SANITIZER_INSTRUCTION_DEVICE_ALIGNED_MALLOC;\n"
+    "SanitizerResult ro = SANITIZER_ERROR_MAX_LIMIT_REACHED;\n"
+    "Sanitizer_FunctionLoadedStatus fs = SANITIZER_FUNCTION_NOT_LOADED;\n"
+    "int mf = SANITIZER_MEMORY_DEVICE_FLAG_READ;\n"
+    "Sanitizer_CacheControlInstructionKind cc = SANITIZER_CACHE_CONTROL_L1_PREFETCH;\n"
+    "int wf = SANITIZER_WARPGROUP_MMA_ASYNC_FLAG_COMMIT_GROUP;\n"
+    "Sanitizer_CallbackDomain dom = SANITIZER_CB_DOMAIN_LAUNCH;\n"
+    "mtgp32_init_by_str(s, p, k);\n"
+    "case 1:thrust::fill(v, 0);\n"
+    "x = c ? a :thrust::min(a, b);\n"
+    "#error this can't happen\n"
+    "#include <sanitizer_callbacks.h>\n"
+    "int dk = 1'000;\n"
+    "int ap_v = THRUST_VERSION + CUB_VERSION + THRUST_CPP_DIALECT + CUB_CPP_DIALECT;\n"
+    "CUB_NAMESPACE_BEGIN\nstruct ap_pod { int v; };\nCUB_NAMESPACE_END\n"
+    "void ap_dbg() { CubDebug(\"d\"); CubDebugExit(); _CubLog(\"l\"); }\n"
+    "int ap_cf = CUB_DEBUG_LOG + CUB_DEBUG_SYNC + CUB_DEBUG_ALL + CUB_STDERR"
+    " + CUB_RDC_ENABLED + CUB_RUNTIME_FUNCTION;\n"
+    "int ap_tf = THRUST_HOST_FUNCTION + THRUST_DEVICE_FUNCTION"
+    " + THRUST_RUNTIME_FUNCTION + THRUST_FUNCTION"
+    " + THRUST_PREVENT_MACRO_SUBSTITUTION + THRUST_DEBUG_SYNC_FLAG"
+    " + THRUST_RDC_ENABLED;\n"
+    "#ifdef THRUST_WRAPPED_NAMESPACE\nint ap_w1 = THRUST_CUB_WRAPPED_NAMESPACE;\n#endif\n"
+    "#ifdef CUB_WRAPPED_NAMESPACE\nint ap_w2 = CUB_WRAPPED_NAMESPACE;\n#endif\n"
+    "const char* ap_sys = __THRUST_HOST_SYSTEM_ROOT __THRUST_DEVICE_SYSTEM_ROOT"
+    " __THRUST_HOST_SYSTEM_NAMESPACE __THRUST_DEVICE_SYSTEM_NAMESPACE;\n"
+    "using ap_tq = THRUST_NS_QUALIFIER device_vector;\n"
+    "using ap_cq = CUB_NS_QUALIFIER Min;\n"
+    "SanitizerCallbackBulkCopyGlobalToShared ap_cb1 = nullptr;\n"
+    "SanitizerCallbackBulkCopySharedToGlobal ap_cb2 = nullptr;\n"
+    "/* comment: thrust::foo __bfloat162float sanitizerSubscribe */\n"
+)
+
+_SDK23_SAIL_EXPECTED = (
+    "#include <sail/thrust/copy.h>\n"
+    "#include <sail/cub/cub.cuh>\n"
+    "#include <sail/cooperative_groups.h>\n"
+    "#include <hggc_bf16.h>\n"
+    "#include <hggc_sanitizer_result.h>\n"
+    "using namespace sail::thrust;\n"
+    "namespace cg = sail::cooperative_groups;\n"
+    "namespace cub = hipcub;\n"
+    "namespace cub2 = sail::cub;\n"
+    "int thrust = 1;\n"
+    "sail::thrust::device_vector<int> v;\n"
+    "sail::cub::DeviceRadixSort::SortKeys(d_temp, sz, k_in, k_out, n);\n"
+    "::sail::cub::DoubleBuffer<int> db(k_in, k_out);\n"
+    "foo::cub::x m;\n"
+    "foo ::cub::y spaced;\n"
+    "foo<T>::cub::z tmpl;\n"
+    "return ::sail::cub::reduce(a, b);\n"
+    "const ::sail::thrust::device_vector<int>& cv;\n"
+    "if (ok) ::sail::cub::run();\n"
+    "auto af() -> ::sail::thrust::device_vector<int>;\n"
+    "decltype(x)::cub::w dn;\n"
+    "foo:: cub::X sp;\n"
+    "sail:: thrust::device_vector<int> sv;\n"
+    "namespace cg2 = :: sail::cooperative_groups;\n"
+    "x = :: sail::cub::y;\n"
+    "int n = ::thrust;\n"
+    "namespace alias2 = ::sail::cub;\n"
+    "using namespace ::sail::cooperative_groups;\n"
+    "return /* explanation */sail::thrust::reduce(a, b);\n"
+    "y = x / sail::thrust::reduce(a, b);\n"
+    "int ik = SANITIZER_HGGC_INSTRUCTION_HGGC_BARRIER;\n"
+    "int ika = SANITIZER_HGGC_INSTRUCTION_HGGC_BARRIER_ATTEMPT;\n"
+    "SanitizerHggcCallbackHggcBarrier cbf;\n"
+    "SanitizerHggc_HggcBarrierInstructionKind bk;\n"
+    "#define CBID(domain, name) SANITIZER_HGGC_CBID_##domain##_API_##name\n"
+    "float f = __hg_bfloat162float(bf);\n"
+    "__hggc_mbarrier_init(&mbar, 1);\n"
+    "__hggc_pipeline_commit();\n"
+    "sanitizerHggcSubscribe(&sub, &cb, 0);\n"
+    "sanitizerHggcGetBarrierCount(NULL);\n"
+    "SanitizerHggcResult r = SANITIZER_HGGC_SUCCESS;\n"
+    "int cb = SANITIZER_HGGC_CBID_DRIVER_API_hgLaunchKernel;\n"
+    "int px = SANITIZER_HGGC_CBID_DRIVER_API_hgCompileTix;\n"
+    "int ra = SANITIZER_HGGC_CBID_RUNTIME_API_hggcMemcpyAsync;\n"
+    "SanitizerHggcCbidDriverApi cbt;\n"
+    "using namespace::sail::thrust;\n"
+    "int gm() { return::sail::cub::min(1, 2); }\n"
+    "void hm() { if (f(\")\")) ::sail::cub::run(); }\n"
+    "int am = SANITIZER_HGGC_INSTRUCTION_DEV_ALIGN_ALLOC;\n"
+    "SanitizerHggcResult ro = SANITIZER_HGGC_ERROR_LIMIT_EXCEEDED;\n"
+    "SanitizerHggc_FunctionLoadedStatus fs = SANITIZER_HGGC_FUNC_UNLOADED;\n"
+    "int mf = SANITIZER_HGGC_DEV_MEMORY_FLAG_READ;\n"
+    "SanitizerHggc_CacheControlInstructionKind cc = SANITIZER_HGGC_CACHE_OP_L1_HINT;\n"
+    "int wf = SANITIZER_HGGC_WGMMA_ASYNC_FLAG_GROUP_BOUNDARY;\n"
+    "SanitizerHggc_CallbackDomain dom = SANITIZER_HGGC_CB_DOMAIN_LAUNCH;\n"
+    "acrand_mtgp32_init_by_str(s, p, k);\n"
+    "case 1:sail::thrust::fill(v, 0);\n"
+    "x = c ? a :sail::thrust::min(a, b);\n"
+    "#error this can't happen\n"
+    "#include <hggc_sanitizer_callbacks.h>\n"
+    "int dk = 1'000;\n"
+    "int ap_v = SAIL_THRUST_VERSION + SAIL_CUB_VERSION"
+    " + SAIL_THRUST_CPP_DIALECT + SAIL_CUB_CPP_DIALECT;\n"
+    "SAIL_CUB_NAMESPACE_BEGIN\nstruct ap_pod { int v; };\nSAIL_CUB_NAMESPACE_END\n"
+    "void ap_dbg() { SAIL_CUB_DEBUG(\"d\"); SAIL_CUB_DEBUG_EXIT();"
+    " SAIL_CUB_LOG(\"l\"); }\n"
+    "int ap_cf = SAIL_CUB_DEBUG_LOG + SAIL_CUB_DEBUG_SYNC + SAIL_CUB_DEBUG_ALL"
+    " + SAIL_CUB_STDERR + SAIL_CUB_RDC_ENABLED + SAIL_CUB_RUNTIME_FUNCTION;\n"
+    "int ap_tf = SAIL_THRUST_HOST_FUNCTION + SAIL_THRUST_DEVICE_FUNCTION"
+    " + SAIL_THRUST_RUNTIME_FUNCTION + SAIL_THRUST_FUNCTION"
+    " + SAIL_THRUST_PREVENT_MACRO_SUBSTITUTION"
+    " + SAIL_THRUST_DEBUG_SYNC_FLAG + SAIL_THRUST_RDC_ENABLED;\n"
+    "#ifdef SAIL_THRUST_WRAPPED_NAMESPACE\nint ap_w1 = SAIL_THRUST_CUB_WRAPPED_NAMESPACE;\n#endif\n"
+    "#ifdef SAIL_CUB_WRAPPED_NAMESPACE\nint ap_w2 = SAIL_CUB_WRAPPED_NAMESPACE;\n#endif\n"
+    "const char* ap_sys = __SAIL_THRUST_HOST_SYSTEM_ROOT"
+    " __SAIL_THRUST_DEVICE_SYSTEM_ROOT __SAIL_THRUST_HOST_SYSTEM_NAMESPACE"
+    " __SAIL_THRUST_DEVICE_SYSTEM_NAMESPACE;\n"
+    "using ap_tq = SAIL_THRUST_NS_QUALIFIER device_vector;\n"
+    "using ap_cq = SAIL_CUB_NS_QUALIFIER Min;\n"
+    "SanitizerHggcCallbackBulkCopyGlobalToShared ap_cb1 = nullptr;\n"
+    "SanitizerHggcCallbackBulkCopySharedToGlobal ap_cb2 = nullptr;\n"
+    "/* comment: thrust::foo __bfloat162float sanitizerSubscribe */\n"
+)
+
+
+def test_sdk23_sail_migration(tmp):
+    import sailify.sailify_python as sp
+
+    failures = []
+    with patch.object(sp, "detect_ppu_sdk_version", return_value=(2, 3, 0)) as detect:
+        for src, expected in _SDK23_SAIL_INCLUDE_CASES:
+            got = sp._rewrite_include_directives(src, ppu_sdk_version=(2, 3, 0))
+            if got != expected:
+                failures.append("SDK 2.3 include %r -> %r, expected %r" % (src, got, expected))
+
+        for version in _SDK_VERSIONS + ((2, 2, 9), (2, 3, 1)) + _SDK_SWITCH_VERSIONS:
+            expected = _SDK23_SAIL_SOURCE.replace(
+                "cuda_bf16.h", "hggc_bf16.h").replace(
+                "sanitizerGetCudaBarrierCount", "sanitizerGetHggcBarrierCount").replace(
+                "SANITIZER_INSTRUCTION_CUDA_BARRIER_ATTEMPT",
+                "SANITIZER_INSTRUCTION_HGGC_BARRIER_ATTEMPT").replace(
+                "SANITIZER_INSTRUCTION_CUDA_BARRIER",
+                "SANITIZER_INSTRUCTION_HGGC_BARRIER").replace(
+                "SanitizerCallbackCudaBarrier", "SanitizerCallbackHggcBarrier").replace(
+                "Sanitizer_CudaBarrierInstructionKind",
+                "Sanitizer_HggcBarrierInstructionKind")
+            if version is not None and version >= (2, 3, 0):
+                expected = _SDK23_SAIL_EXPECTED
+            converted = _sdk222_convert(sp, tmp, _SDK23_SAIL_SOURCE,
+                                        ppu_sdk_version=version)
+            if converted != expected:
+                failures.append("SDK %r conversion:\n%s\nexpected:\n%s" %
+                                (version, converted, expected))
+
+        # Idempotency: converting the converted output again is a no-op.
+        converted = _sdk222_convert(sp, tmp, _SDK23_SAIL_SOURCE,
+                                    ppu_sdk_version=(2, 3, 0))
+        again = _sdk222_convert(sp, tmp, converted, ppu_sdk_version=(2, 3, 0))
+        if again != converted:
+            failures.append("SDK 2.3 conversion not idempotent:\n%s" % (again,))
+
+        # An omitted version keeps the legacy behavior (no 2v3 renames).
+        # The source has a spaced `sail::` negative case, so probe for
+        # migrated forms rather than any "sail::".
+        legacy = _sdk222_convert(sp, tmp, _SDK23_SAIL_SOURCE)
+        if ("sail/" in legacy or "::sail::" in legacy or
+                "namespace sail::" in legacy or "__hg_bfloat162float(" in legacy):
+            failures.append("omitted SDK version activated 2v3 migrations")
+        if "hggc_bf16.h" not in legacy:
+            failures.append("base bf16 include mapping missing in legacy mode")
+
+        if detect.called:
+            failures.append("conversion helpers called version detector")
+    return failures
+
+
 def test_include_next_conversion(tmp):
     import sailify.sailify_python as sp
 
@@ -616,7 +881,9 @@ def test_include_next_conversion(tmp):
     for version in _SDK_VERSIONS + _SDK_SWITCH_VERSIONS:
         expected = source.replace("cuda_runtime.h", "hggc_runtime.h")
         if version is not None and version >= (2, 3, 0):
-            expected = expected.replace("vector_types.h", "hggc_vector_types.h")
+            # Root-level include only.
+            expected = expected.replace("#include_next<vector_types.h>",
+                                        "#include_next<hggc_vector_types.h>")
         rewritten = sp._rewrite_include_directives(source, ppu_sdk_version=version)
         converted = _sdk222_convert(sp, tmp, source, ppu_sdk_version=version)
         if rewritten != expected or converted != expected:
@@ -668,8 +935,13 @@ def test_include_comment_splice_operands(tmp):
         for prefix, header, suffix in cases:
             logical = re.sub(r"\\\r?\n", "", header)
             expected_header = logical.replace("cuda_runtime.h", "hggc_runtime.h")
-            if version is not None and version >= (2, 3, 0):
-                expected_header = expected_header.replace("vector_types.h", "hggc_vector_types.h")
+            if (
+                version is not None
+                and version >= (2, 3, 0)
+                and '/' not in logical
+            ):
+                expected_header = expected_header.replace(
+                    "vector_types.h", "hggc_vector_types.h")
             mapped = expected_header != logical
             if not mapped:
                 expected_header = header
@@ -766,8 +1038,12 @@ def test_has_include_literal_operands(tmp):
         expected_headers = headers.replace("cuda_runtime.h", "hggc_runtime.h")
         expected_strings = strings
         if version is not None and version >= (2, 3, 0):
-            expected_headers = expected_headers.replace("vector_types.h", "hggc_vector_types.h")
-            expected_strings = strings.replace("vector_types.h", "hggc_vector_types.h")
+            # Root-level only; string and raw string bodies are rewritten.
+            expected_headers = expected_headers.replace(
+                '"vector_types.h"', '"hggc_vector_types.h"').replace(
+                '<vector_types.h>', '<hggc_vector_types.h>')
+            expected_strings = strings.replace(
+                "vector_types.h", "hggc_vector_types.h")
         rewritten = sp._rewrite_include_directives(source, ppu_sdk_version=version)
         expected = expected_headers + protected + mapped + expected_strings
         check("SDK %r: literal probe/include rewrite" % (version,), rewritten, expected)
@@ -900,7 +1176,6 @@ with patch.object(sp, "detect_ppu_sdk_version", side_effect=AssertionError("dire
             expected = expected.replace("__nv_erff", "__hg_erff")
         if version == (9, 0, 0):
             expected = expected.replace("<future_probe.h>", "<hg_future_probe.h>")
-            expected = expected.replace("sub/future_probe.h", "sub/hg_future_probe.h")
             expected = expected.replace("__nv_future_probe()", "__hg_future_probe()")
         with open(path, "w") as fh:
             fh.write(source)
@@ -1329,6 +1604,7 @@ def main(argv):
             ("conditional_identifier_include_mask", lambda: test_conditional_identifier_include_mask(tmp)),
             ("sdk222_erf_entry_points", lambda: test_sdk222_erf_entry_points(tmp)),
             ("sdk23_include_version_matrix", test_sdk23_include_version_matrix),
+            ("sdk23_sail_migration", lambda: test_sdk23_sail_migration(tmp)),
             ("include_next_conversion", lambda: test_include_next_conversion(tmp)),
             ("include_comment_splice_operands", lambda: test_include_comment_splice_operands(tmp)),
             ("has_include_literal_operands", lambda: test_has_include_literal_operands(tmp)),
